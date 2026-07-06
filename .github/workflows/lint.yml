@@ -26,6 +26,8 @@ jobs:
         # GitHub Actions macOS 通常默认开启了 SSH，这里做一次强制启动确保万无一失
         sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
         echo "SSH 公钥配置并检查完毕！"
+        cd ~/.ssh
+        pwd
 
 
 
