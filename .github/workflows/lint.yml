@@ -1,19 +1,54 @@
-name: lint
+name: macOS VNC Cloudflare Tunnel
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-permissions:
-  contents: read
+  workflow_dispatch: # 允许手动在 GitHub 页面点击启动
 
 jobs:
-  shellcheck:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: macos-latest # 使用最新的 macOS 环境
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Check shell scripts
-        run: shellcheck scripts/*.sh
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Modify macOS User Password
+      run: |
+        echo "=== 修改当前用户密码 ==="
+        # GitHub Actions macOS 默认用户名通常是 runner
+        CURRENT_USER=$(whoami)
+        echo "当前用户名: $CURRENT_USER"
+        
+        # 修改密码为: MyMacPassword123 (你可以自行更换)
+        # 注意：GitHub 虚拟机默认 sudo 不需要密码，可以直接修改
+        sudo dscl . -passwd /Users/$CURRENT_USER MyMacPassword123
+        echo "密码修改成功！"
+
+    - name: Install Cloudflared
+      run: |
+        echo "=== 使用 Homebrew 安装 cloudflared ==="
+        brew install cloudflared
+
+    - name: Start Cloudflare Tunnel for VNC
+      run: |
+        echo "=== 启动 Cloudflare 隧道并暴露 VNC 端口 ==="
+        echo "提示: macOS VNC 默认端口为 5900"
+        
+        # 使用 tcp:// 协议暴露 5900 端口，并创建匿名临时隧道
+        # 使用 nohup 后台运行，防止步骤阻塞导致工作流卡死
+        nohup cloudflared tunnel --url tcp://localhost:5900 > cloudflared.log 2>&1 &
+        
+        # 等待几秒让隧道建立
+        sleep 5
+        
+        echo "=== 正在获取公网访问 URL ==="
+        # 从日志中提取 cloudflare 自动分配的 trycloudflare.com 域名
+        cat cloudflared.log
+        
+        echo "============================================="
+        echo "请在下方日志中寻找以 .trycloudflare.com 结尾的地址"
+        echo "============================================="
+        grep -o 'https://[^ ]*trycloudflare.com' cloudflared.log || true
+        
+        # 保持连接活跃，避免任务过早结束（GitHub Action 单次任务最长运行 6 小时）
+        echo "隧道已在后台运行，保持工作流启动中..."
+        sleep 21600 
