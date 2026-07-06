@@ -11,14 +11,21 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Modify macOS User Password
+    - name: Configure SSH Public Key
       run: |
-        echo "=== 修改当前用户密码 ==="
-        CURRENT_USER=$(whoami)
+        echo "=== 配置 SSH 公钥 ==="
+        # 创建 .ssh 目录
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
         
-        # 强制将新密码写入该用户
-        echo -e "MyMacPassword123\nMyMacPassword123" | sudo passwd $CURRENT_USER
-        echo "密码修改成功！"
+        # 写入用户提供的公钥
+        echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDLuhz22ToZqgqsMCG5hPAZjDL7vRjOqlHRYPuMDt4s3XXukd7ie7ABZdzsaR67K4eDvNQvChco8vBJzGqjxdNCqXZhHF7E6/imScLl2BAk7Pn5Xt5yQBsdBcuGhYu+eGS/gI9ykHmaS4wiEzb6XsQMSiMwwv9fkIXZCRdeGLDBxRErHPSqeZ5/y4wkcMJ0MgctDjQrq7G0vdXe+01v2NhVy40NKGGfFfnBAQsx4Rc1hXAT3cRxpxq/GeKpkHuUkhsDs51o3vSNZun3pY1i6R+lSfdtbOfIWokmUTM1Pe9z/xOjN/ePs+DzuEOaJO1mNru5LB3BpRQ/YhXm0T3/BeaLjc7RLTQJYKeiDeXmQw9PWxZIeGCydoxW+l7bumgrQ1Q5+cqTrHgoLXDEEUGSrXjtmfGgOQV5R/UkkoKB0aKTA0WFIWNaCvFyVa9NKee9bbdkFL47TyyW1N/pBkf50EJ+delFNUTqWJcBMNybCE8T5hZl9UmDDkdIesIgTs6tVaFE3c1f95ch8bOqgCugnXbHEXMUa7j1pzVKCC1OBxvANYwrovezQHeXR5QeNmPz7XuA9NrzQSyeLU+t94DTXkH7CqCASsjIogCjy/kMXK/pCjZeH36TfyGYXUWvnOnOEUWc8+70CCN59WZ5+XbE5q63NDg/F/ASPHXnu2OAOVDSBQ=" > ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        
+        echo "=== 检查并启动 macOS SSH 服务 ==="
+        # GitHub Actions macOS 通常默认开启了 SSH，这里做一次强制启动确保万无一失
+        sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+        echo "SSH 公钥配置并检查完毕！"
 
 
 
