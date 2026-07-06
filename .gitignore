@@ -1,0 +1,11 @@
+# Cloudflare local credentials and tokens
+.cloudflared/
+*.pem
+*.key
+*.crt
+*.json
+.env
+.env.*
+
+# macOS
+.DS_Store
