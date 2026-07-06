@@ -14,13 +14,11 @@ jobs:
     - name: Modify macOS User Password
       run: |
         echo "=== 修改当前用户密码 ==="
-        # GitHub Actions macOS 默认用户名通常是 runner
         CURRENT_USER=$(whoami)
         echo "当前用户名: $CURRENT_USER"
         
-        # 修改密码为: MyMacPassword123 (你可以自行更换)
-        # 注意：GitHub 虚拟机默认 sudo 不需要密码，可以直接修改
-        sudo dscl . -passwd /Users/$CURRENT_USER MyMacPassword123
+        # 使用 sysadminctl 强制修改密码
+        sudo sysadminctl -adminUser "$CURRENT_USER" -password "MyMacPassword123"
         echo "密码修改成功！"
 
     - name: Install Cloudflared
