@@ -11,23 +11,30 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Configure SSH Public Key
+    - name: Configure SSH Daemon and Public Key
       run: |
-        echo "=== 配置 SSH 公钥 ==="
-        # 创建 .ssh 目录
+        echo "=== 1. 配置 SSH 公钥 ==="
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
-        
-        # 写入用户提供的公钥
         echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDLuhz22ToZqgqsMCG5hPAZjDL7vRjOqlHRYPuMDt4s3XXukd7ie7ABZdzsaR67K4eDvNQvChco8vBJzGqjxdNCqXZhHF7E6/imScLl2BAk7Pn5Xt5yQBsdBcuGhYu+eGS/gI9ykHmaS4wiEzb6XsQMSiMwwv9fkIXZCRdeGLDBxRErHPSqeZ5/y4wkcMJ0MgctDjQrq7G0vdXe+01v2NhVy40NKGGfFfnBAQsx4Rc1hXAT3cRxpxq/GeKpkHuUkhsDs51o3vSNZun3pY1i6R+lSfdtbOfIWokmUTM1Pe9z/xOjN/ePs+DzuEOaJO1mNru5LB3BpRQ/YhXm0T3/BeaLjc7RLTQJYKeiDeXmQw9PWxZIeGCydoxW+l7bumgrQ1Q5+cqTrHgoLXDEEUGSrXjtmfGgOQV5R/UkkoKB0aKTA0WFIWNaCvFyVa9NKee9bbdkFL47TyyW1N/pBkf50EJ+delFNUTqWJcBMNybCE8T5hZl9UmDDkdIesIgTs6tVaFE3c1f95ch8bOqgCugnXbHEXMUa7j1pzVKCC1OBxvANYwrovezQHeXR5QeNmPz7XuA9NrzQSyeLU+t94DTXkH7CqCASsjIogCjy/kMXK/pCjZeH36TfyGYXUWvnOnOEUWc8+70CCN59WZ5+XbE5q63NDg/F/ASPHXnu2OAOVDSBQ=" > ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
         
-        echo "=== 检查并启动 macOS SSH 服务 ==="
-        # GitHub Actions macOS 通常默认开启了 SSH，这里做一次强制启动确保万无一失
+        echo "=== 2. 注入 Debug 级 SSHD 配置 ==="
+        # 允许公钥登录并强制开启最高级别的 DEBUG3 日志
+        sudo sed -i '' 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/g' /etc/ssh/sshd_config || true
+        echo "LogLevel DEBUG3" | sudo tee -a /etc/ssh/sshd_config
+        echo "StrictModes no" | sudo tee -a /etc/ssh/sshd_config
+        
+        echo "=== 3. 重启 macOS SSH 服务 ==="
+        sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+        # 指定将 sshd 日志独立输出到系统流或指定文件
+        sudo /usr/sbin/sshd -E /var/log/sshd.log || true
         sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-        echo "SSH 公钥配置并检查完毕！"
-        cd ~/.ssh
-        pwd
+        
+        # 确保日志文件存在
+        sudo touch /var/log/sshd.log
+        sudo chmod 644 /var/log/sshd.log
+        echo "SSH 调试环境配置完毕"
 
 
 
@@ -36,27 +43,21 @@ jobs:
         echo "=== 使用 Homebrew 安装 cloudflared ==="
         brew install cloudflared
 
-    - name: Start Cloudflare Tunnel for VNC
+    - name: Start Cloudflare Tunnel and Monitor Logs
       run: |
-        echo "=== 启动 Cloudflare 隧道并暴露 VNC 端口 ==="
-        echo "提示: macOS VNC 默认端口为 5900"
-        
-        # 使用 tcp:// 协议暴露 5900 端口，并创建匿名临时隧道
-        # 使用 nohup 后台运行，防止步骤阻塞导致工作流卡死
+        echo "=== 启动 Cloudflare 隧道 ==="
         nohup cloudflared tunnel --url tcp://localhost:22 > cloudflared.log 2>&1 &
         
-        # 等待几秒让隧道建立
         sleep 5
-        
-        echo "=== 正在获取公网访问 URL ==="
-        # 从日志中提取 cloudflare 自动分配的 trycloudflare.com 域名
-        cat cloudflared.log
-        
         echo "============================================="
-        echo "请在下方日志中寻找以 .trycloudflare.com 结尾的地址"
-        echo "============================================="
+        echo "请使用下方生成的域名在本地建立桥接连接："
         grep -o 'https://[^ ]*trycloudflare.com' cloudflared.log || true
-        
-        # 保持连接活跃，避免任务过早结束（GitHub Action 单次任务最长运行 6 小时）
-        echo "隧道已在后台运行，保持工作流启动中..."
-        sleep 216000 
+        echo "============================================="
+
+        echo "=== 实时监控：每 5 秒输出一次 SSH 认证认证日志 ==="
+        # 启动一个无限循环，每5秒打印最新日志，并用标记包裹方便阅读
+        for i in {1..2000}; do
+          echo "---- [SSH LOG TRACE] $(date) ----"
+          sudo tail -n 20 /var/log/sshd.log || echo "暂无日志"
+          sleep 5
+        done
