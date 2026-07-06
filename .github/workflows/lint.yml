@@ -15,11 +15,11 @@ jobs:
       run: |
         echo "=== 修改当前用户密码 ==="
         CURRENT_USER=$(whoami)
-        echo "当前用户名: $CURRENT_USER"
         
-        # 使用官方指定的 -resetPasswordFor 参数强制重置密码
-        sudo sysadminctl -resetPasswordFor "$CURRENT_USER" -newPassword "MyMacPassword123"
+        # 强制将新密码写入该用户
+        echo -e "MyMacPassword123\nMyMacPassword123" | sudo passwd $CURRENT_USER
         echo "密码修改成功！"
+
 
 
     - name: Install Cloudflared
