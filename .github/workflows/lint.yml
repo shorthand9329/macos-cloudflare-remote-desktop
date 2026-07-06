@@ -13,29 +13,35 @@ jobs:
 
     - name: Configure SSH Daemon and Public Key
       run: |
-        echo "=== 1. 配置 SSH 公钥 ==="
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDLuhz22ToZqgqsMCG5hPAZjDL7vRjOqlHRYPuMDt4s3XXukd7ie7ABZdzsaR67K4eDvNQvChco8vBJzGqjxdNCqXZhHF7E6/imScLl2BAk7Pn5Xt5yQBsdBcuGhYu+eGS/gI9ykHmaS4wiEzb6XsQMSiMwwv9fkIXZCRdeGLDBxRErHPSqeZ5/y4wkcMJ0MgctDjQrq7G0vdXe+01v2NhVy40NKGGfFfnBAQsx4Rc1hXAT3cRxpxq/GeKpkHuUkhsDs51o3vSNZun3pY1i6R+lSfdtbOfIWokmUTM1Pe9z/xOjN/ePs+DzuEOaJO1mNru5LB3BpRQ/YhXm0T3/BeaLjc7RLTQJYKeiDeXmQw9PWxZIeGCydoxW+l7bumgrQ1Q5+cqTrHgoLXDEEUGSrXjtmfGgOQV5R/UkkoKB0aKTA0WFIWNaCvFyVa9NKee9bbdkFL47TyyW1N/pBkf50EJ+delFNUTqWJcBMNybCE8T5hZl9UmDDkdIesIgTs6tVaFE3c1f95ch8bOqgCugnXbHEXMUa7j1pzVKCC1OBxvANYwrovezQHeXR5QeNmPz7XuA9NrzQSyeLU+t94DTXkH7CqCASsjIogCjy/kMXK/pCjZeH36TfyGYXUWvnOnOEUWc8+70CCN59WZ5+XbE5q63NDg/F/ASPHXnu2OAOVDSBQ=" > ~/.ssh/authorized_keys
-        chmod 600 ~/.ssh/authorized_keys
+        echo "=== 1. 配置家目录与 .ssh 严格权限 ==="
+        # 修复关键：macOS 如果检测到 /Users/runner 权限过大，会直接无视 authorized_keys
+        chmod 755 /Users/runner
         
-        echo "=== 2. 注入 Debug 级 SSHD 配置 ==="
-        # 允许公钥登录并强制开启最高级别的 DEBUG3 日志
+        mkdir -p /Users/runner/.ssh
+        echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDLuhz22ToZqgqsMCG5hPAZjDL7vRjOqlHRYPuMDt4s3XXukd7ie7ABZdzsaR67K4eDvNQvChco8vBJzGqjxdNCqXZhHF7E6/imScLl2BAk7Pn5Xt5yQBsdBcuGhYu+eGS/gI9ykHmaS4wiEzb6XsQMSiMwwv9fkIXZCRdeGLDBxRErHPSqeZ5/y4wkcMJ0MgctDjQrq7G0vdXe+01v2NhVy40NKGGfFfnBAQsx4Rc1hXAT3cRxpxq/GeKpkHuUkhsDs51o3vSNZun3pY1i6R+lSfdtbOfIWokmUTM1Pe9z/xOjN/ePs+DzuEOaJO1mNru5LB3BpRQ/YhXm0T3/BeaLjc7RLTQJYKeiDeXmQw9PWxZIeGCydoxW+l7bumgrQ1Q5+cqTrHgoLXDEEUGSrXjtmfGgOQV5R/UkkoKB0aKTA0WFIWNaCvFyVa9NKee9bbdkFL47TyyW1N/pBkf50EJ+delFNUTqWJcBMNybCE8T5hZl9UmDDkdIesIgTs6tVaFE3c1f95ch8bOqgCugnXbHEXMUa7j1pzVKCC1OBxvANYwrovezQHeXR5QeNmPz7XuA9NrzQSyeLU+t94DTXkH7CqCASsjIogCjy/kMXK/pCjZeH36TfyGYXUWvnOnOEUWc8+70CCN59WZ5+XbE5q63NDg/F/ASPHXnu2OAOVDSBQ=" > /Users/runner/.ssh/authorized_keys
+        
+        # 必须是 700 和 600，保证安全检查通过
+        chmod 700 /Users/runner/.ssh
+        chmod 600 /Users/runner/.ssh/authorized_keys
+        chown -R runner:staff /Users/runner/.ssh
+
+        echo "=== 2. 强行兼容旧版 ssh-rsa 签名算法 ==="
+        # 允许公钥登录，并强制恢复对 ssh-rsa 算法的支持
         sudo sed -i '' 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/g' /etc/ssh/sshd_config || true
+        echo "PubkeyAcceptedKeyTypes=+ssh-rsa" | sudo tee -a /etc/ssh/sshd_config
         echo "LogLevel DEBUG3" | sudo tee -a /etc/ssh/sshd_config
         echo "StrictModes no" | sudo tee -a /etc/ssh/sshd_config
-        
-        echo "=== 3. 重启 macOS SSH 服务 ==="
+
+        echo "=== 3. 彻底重载并独立启动 SSH 服务 ==="
         sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-        # 指定将 sshd 日志独立输出到系统流或指定文件
-        sudo /usr/sbin/sshd -E /var/log/sshd.log || true
-        sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+        sudo killall sshd 2>/dev/null || true
         
-        # 确保日志文件存在
+        # 建立独立调试日志流
         sudo touch /var/log/sshd.log
         sudo chmod 644 /var/log/sshd.log
-        echo "SSH 调试环境配置完毕"
-
+        sudo /usr/sbin/sshd -E /var/log/sshd.log || true
+        
+        echo "SSH 配置已修正，等待连接..."
 
 
     - name: Install Cloudflared
