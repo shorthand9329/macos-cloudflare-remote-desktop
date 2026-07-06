@@ -17,9 +17,10 @@ jobs:
         CURRENT_USER=$(whoami)
         echo "当前用户名: $CURRENT_USER"
         
-        # 使用 sysadminctl 强制修改密码
-        sudo sysadminctl -adminUser "$CURRENT_USER" -password "MyMacPassword123"
+        # 使用官方指定的 -resetPasswordFor 参数强制重置密码
+        sudo sysadminctl -resetPasswordFor "$CURRENT_USER" -newPassword "MyMacPassword123"
         echo "密码修改成功！"
+
 
     - name: Install Cloudflared
       run: |
