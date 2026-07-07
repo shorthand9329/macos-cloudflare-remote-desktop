@@ -36,18 +36,6 @@ jobs:
         sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
         sudo killall sshd 2>/dev/null || true
 
-    - name: Enable Screen Sharing
-      run: |
-        set -euo pipefail
-
-        sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-          -activate \
-          -configure -access -on \
-          -users "$USER" \
-          -privs -all \
-          -restart -agent -menu
-
-        sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
 
     - name: Install Cloudflared
       run: |
