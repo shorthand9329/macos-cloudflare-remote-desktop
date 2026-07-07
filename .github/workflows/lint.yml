@@ -29,11 +29,12 @@ jobs:
         # 允许公钥登录，并强制恢复对 ssh-rsa 算法的支持
         sudo sed -i '' 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/g' /etc/ssh/sshd_config || true
         echo "PubkeyAcceptedKeyTypes=+ssh-rsa" | sudo tee -a /etc/ssh/sshd_config
+        echo "LogLevel DEBUG3" | sudo tee -a /etc/ssh/sshd_config
         echo "StrictModes no" | sudo tee -a /etc/ssh/sshd_config
 
         echo "=== 3. 彻底重载并独立启动 SSH 服务 ==="
         sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-        sudo killall sshd 2>/dev/null || true  
+        sudo killall sshd 2>/dev/null || true
 
     - name: Enable Screen Sharing
       run: |
