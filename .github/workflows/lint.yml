@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14 # 使用最新的 macOS 环境
+    runs-on: macos-15 # 使用最新的 macOS 环境
 
     steps:
     - name: Checkout repository
@@ -35,6 +35,13 @@ jobs:
         echo "=== 3. 彻底重载并独立启动 SSH 服务 ==="
         sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
         sudo killall sshd 2>/dev/null || true
+        
+        # 建立独立调试日志流
+        sudo touch /var/log/sshd.log
+        sudo chmod 644 /var/log/sshd.log
+        sudo /usr/sbin/sshd -E /var/log/sshd.log || true
+        
+        echo "SSH 配置已修正，等待连接..."
 
 
     - name: Install Cloudflared
@@ -52,4 +59,7 @@ jobs:
         echo "请使用下方生成的域名在本地建立桥接连接："
         grep -o 'https://[^ ]*trycloudflare.com' cloudflared.log || true
         echo "============================================="
+
+        echo "=== 实时监控：每 5 秒输出一次 SSH 认证认证日志 ==="
+        # 启动一个无限循环，每5秒打印最新日志，并用标记包裹方便阅读
         sleep 21800
