@@ -29,20 +29,24 @@ jobs:
         # 允许公钥登录，并强制恢复对 ssh-rsa 算法的支持
         sudo sed -i '' 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/g' /etc/ssh/sshd_config || true
         echo "PubkeyAcceptedKeyTypes=+ssh-rsa" | sudo tee -a /etc/ssh/sshd_config
-        echo "LogLevel DEBUG3" | sudo tee -a /etc/ssh/sshd_config
         echo "StrictModes no" | sudo tee -a /etc/ssh/sshd_config
 
         echo "=== 3. 彻底重载并独立启动 SSH 服务 ==="
         sudo launchctl unload -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-        sudo killall sshd 2>/dev/null || true
-        
-        # 建立独立调试日志流
-        sudo touch /var/log/sshd.log
-        sudo chmod 644 /var/log/sshd.log
-        sudo /usr/sbin/sshd -E /var/log/sshd.log || true
-        
-        echo "SSH 配置已修正，等待连接..."
+        sudo killall sshd 2>/dev/null || true  
 
+    - name: Enable Screen Sharing
+      run: |
+        set -euo pipefail
+
+        sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+          -activate \
+          -configure -access -on \
+          -users "$USER" \
+          -privs -all \
+          -restart -agent -menu
+
+        sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
 
     - name: Install Cloudflared
       run: |
@@ -59,11 +63,4 @@ jobs:
         echo "请使用下方生成的域名在本地建立桥接连接："
         grep -o 'https://[^ ]*trycloudflare.com' cloudflared.log || true
         echo "============================================="
-
-        echo "=== 实时监控：每 5 秒输出一次 SSH 认证认证日志 ==="
-        # 启动一个无限循环，每5秒打印最新日志，并用标记包裹方便阅读
-        for i in {1..2000}; do
-          echo "---- [SSH LOG TRACE] $(date) ----"
-          sudo tail -n 20 /var/log/sshd.log || echo "暂无日志"
-          sleep 5
-        done
+        sleep 21800
