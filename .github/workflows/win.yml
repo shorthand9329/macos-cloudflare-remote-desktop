@@ -7,48 +7,48 @@ jobs:
   build:
     runs-on: windows-latest
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
-  
-  - name: Enable RDP and set password
-    shell: powershell
-    run: |
-      Write-Host "=== 启用远程桌面 ==="
-  
-      # 启用 RDP
-      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-  
-      # 开启防火墙规则
-      Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-  
-      # 设置 runner 用户密码（必须）
-      $password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
-      Set-LocalUser -Name "runneradmin" -Password $password
-  
-      Write-Host "RDP 已开启，用户名: runneradmin"
-  
-  - name: Download cloudflared
-    shell: powershell
-    run: |
-      Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
-  
-  - name: Start Cloudflare Tunnel
-    shell: powershell
-    run: |
-      Write-Host "=== 启动 Cloudflare Tunnel (RDP 3389) ==="
-  
-      Start-Process -NoNewWindow -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url tcp://localhost:3389" -RedirectStandardOutput "cloudflared.log" -RedirectStandardError "cloudflared.log"
-  
-      Start-Sleep -Seconds 10
-  
-      Write-Host "============================================="
-      Write-Host "复制下面的地址，用 Cloudflare TCP 方式连接："
-      Get-Content cloudflared.log | Select-String "trycloudflare.com"
-      Write-Host "============================================="
-  
-      Write-Host "账号: runneradmin"
-      Write-Host "密码: P@ssw0rd123!"
-  
-      # 保持运行
-      Start-Sleep -Seconds 21800
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Enable RDP and set password
+        shell: powershell
+        run: |
+          Write-Host "=== 启用远程桌面 ==="
+      
+          # 启用 RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+      
+          # 开启防火墙规则
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      
+          # 设置 runner 用户密码（必须）
+          $password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $password
+      
+          Write-Host "RDP 已开启，用户名: runneradmin"
+      
+      - name: Download cloudflared
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
+      
+      - name: Start Cloudflare Tunnel
+        shell: powershell
+        run: |
+          Write-Host "=== 启动 Cloudflare Tunnel (RDP 3389) ==="
+      
+          Start-Process -NoNewWindow -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url tcp://localhost:3389" -RedirectStandardOutput "cloudflared.log" -RedirectStandardError "cloudflared.log"
+      
+          Start-Sleep -Seconds 10
+      
+          Write-Host "============================================="
+          Write-Host "复制下面的地址，用 Cloudflare TCP 方式连接："
+          Get-Content cloudflared.log | Select-String "trycloudflare.com"
+          Write-Host "============================================="
+      
+          Write-Host "账号: runneradmin"
+          Write-Host "密码: P@ssw0rd123!"
+      
+          # 保持运行
+          Start-Sleep -Seconds 21800
