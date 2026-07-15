@@ -1,0 +1,497 @@
+name: "macOS Remote Desktop (GUI)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-gui:
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    env:
+      VNC_PASSWORD: mac2026A
+      GUI_USER: macgui
+      GUI_PASS: mac2026A
+
+    steps:
+      # -----------------------------------------------------
+      # 1. SYSTEM INFORMATION
+      # -----------------------------------------------------
+      - name: "System Information"
+        run: |
+          echo "=== macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) ==="
+          echo "Arch: $(uname -m)"
+          echo "CPU: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'Apple Silicon')"
+          echo "RAM: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          echo "Free disk: $(df -h / | tail -1 | awk '{print $4}')"
+          echo "Xcode: $(xcodebuild -version 2>/dev/null | head -1 || echo 'N/A')"
+          echo "--- Displays before configuration ---"
+          system_profiler SPDisplaysDataType 2>/dev/null | head -25 || true
+
+      # -----------------------------------------------------
+      # 2. CREATE A GUI USER WITH A KNOWN PASSWORD
+      # -----------------------------------------------------
+      - name: "Create GUI user (${{ env.GUI_USER }})"
+        run: |
+          echo ">>> Creating user '$GUI_USER' with a known password..."
+          # Create user via dscl (tested method on GitHub Actions)
+          sudo dscl . -create /Users/$GUI_USER
+          sudo dscl . -create /Users/$GUI_USER UserShell /bin/zsh
+          sudo dscl . -create /Users/$GUI_USER RealName "macOS GUI"
+          sudo dscl . -create /Users/$GUI_USER UniqueID 550
+          sudo dscl . -create /Users/$GUI_USER PrimaryGroupID 20
+          sudo dscl . -create /Users/$GUI_USER NFSHomeDirectory /Users/$GUI_USER
+          sudo dscl . -passwd /Users/$GUI_USER "$GUI_PASS"
+          sudo createhomedir -c -u $GUI_USER > /dev/null 2>&1 || true
+          sudo dscl . -append /Groups/admin GroupMembership $GUI_USER
+
+          # Verify
+          if sudo dscl . -authonly $GUI_USER "$GUI_PASS" 2>/dev/null; then
+            echo "GUI user '$GUI_USER' created with password '$GUI_PASS'"
+          else
+            echo "Password verification failed, trying sysadminctl..."
+            sudo sysadminctl -addUser $GUI_USER -password "$GUI_PASS" -admin 2>/dev/null || true
+            sudo dscl . -authonly $GUI_USER "$GUI_PASS" 2>/dev/null && \
+              echo "User created via sysadminctl" || \
+              echo "Could not verify the password (Legacy VNC does not require the system password)"
+          fi
+
+      # -----------------------------------------------------
+      # 3. CREATE A VIRTUAL DISPLAY (BLACK SCREEN FIX)
+      #    The GitHub VM is headless and has no real framebuffer.
+      #    CGVirtualDisplay (macOS 14+) creates a software display.
+      # -----------------------------------------------------
+      - name: "Create 1920x1080 Virtual Display"
+        run: |
+          cat > /tmp/create-display.swift << 'SWIFTEOF'
+          import CoreGraphics
+          import Foundation
+
+          // --- Descriptor ---
+          let desc = CGVirtualDisplayDescriptor()
+          desc.queue = DispatchQueue.main
+          desc.name = "GitHub Actions Display"
+          desc.maxPixelsWide = 1920
+          desc.maxPixelsHigh = 1080
+          desc.sizeInMillimeters = CGSize(width: 597, height: 336)
+          desc.productID = 0xDA1F
+          desc.vendorID  = 0xDA10
+          desc.serialNum = 0x0001
+
+          guard let display = CGVirtualDisplay(descriptor: desc) else {
+              fputs("ERROR: CGVirtualDisplay init returned nil\n", stderr)
+              exit(1)
+          }
+
+          // --- Mode 1920x1080 @ 60 Hz ---
+          let mode = CGVirtualDisplayMode()
+          mode.width  = 1920
+          mode.height = 1080
+          mode.refreshRate = 60.0
+
+          let settings = CGVirtualDisplaySettings()
+          settings.modes = [mode]
+          settings.hiDPI = 0
+
+          let ok = display.applySettings(settings)
+          print("DISPLAY_ID=\(display.displayID)")
+          print("RESOLUTION=1920x1080@60")
+          print("SETTINGS_APPLIED=\(ok)")
+
+          // --- Try to make it the main display ---
+          var config: CGDisplayConfigRef?
+          if CGBeginDisplayConfiguration(&config) == .success {
+              CGConfigureDisplayOrigin(config!, display.displayID, 0, 0)
+              let result = CGCompleteDisplayConfiguration(config!, .forSession)
+              print("SET_AS_MAIN=\(result == .success)")
+          }
+
+          // Keep the process alive indefinitely
+          signal(SIGINT,  SIG_IGN)
+          signal(SIGTERM, SIG_IGN)
+          dispatchMain()
+          SWIFTEOF
+
+          echo ">>> Compiling virtual display helper..."
+          if swiftc -O /tmp/create-display.swift -o /tmp/create-display 2>/tmp/swift-error.log; then
+            echo "Compiled OK"
+            /tmp/create-display > /tmp/display-output.log 2>&1 &
+            VDPID=$!
+            sleep 4
+
+            if kill -0 $VDPID 2>/dev/null; then
+              cat /tmp/display-output.log
+              echo "Virtual display active (PID: $VDPID)"
+            else
+              echo "Virtual display process exited unexpectedly:"
+              cat /tmp/display-output.log
+            fi
+          else
+            echo "Swift compilation failed (macOS $(sw_vers -productVersion)):"
+            cat /tmp/swift-error.log
+            echo ""
+            echo ">>> Continuing without a virtual display..."
+          fi
+
+          echo "--- Displays after creating virtual display ---"
+          system_profiler SPDisplaysDataType 2>/dev/null | head -25 || true
+
+      # -----------------------------------------------------
+      # 4. AUTO-LOGIN + DESKTOP GUI SESSION
+      # -----------------------------------------------------
+      - name: "Configure auto-login and GUI session"
+        run: |
+          # --------------------------------------------------
+          # DISABLE SLEEP / SCREENSAVER
+          # --------------------------------------------------
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 hibernatemode 0
+          sudo pmset -a autorestart 1
+          defaults write com.apple.screensaver idleTime 0
+          sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
+
+          # --------------------------------------------------
+          # CONFIGURE AUTO-LOGIN FOR $GUI_USER
+          # --------------------------------------------------
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "$GUI_USER"
+          sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool false
+
+          # Create /etc/kcpassword (XOR-encoded password for auto-login)
+          echo ">>> Generating kcpassword..."
+          python3 << PYEOF
+          import sys
+          key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
+          pw = b"${GUI_PASS}\x00"
+          enc = bytearray(p ^ key[i % len(key)] for i, p in enumerate(pw))
+          while len(enc) % 12:
+              enc.append(0)
+          with open("/tmp/kcpassword", "wb") as f:
+              f.write(enc)
+          print(f"kcpassword generated ({len(enc)} bytes)")
+          PYEOF
+          sudo cp /tmp/kcpassword /etc/kcpassword
+          sudo chmod 600 /etc/kcpassword
+          sudo chown root:wheel /etc/kcpassword
+
+          # --------------------------------------------------
+          # ACTIVATE THE GUI SESSION WITHOUT KILLING LOGINWINDOW
+          # (killall loginwindow kills the runner -> exit 143)
+          # launchctl kickstart is safe for the runner
+          # --------------------------------------------------
+          echo ">>> Activating GUI session..."
+
+          # Method 1: kickstart restarts loginwindow via launchd (does not kill the runner)
+          sudo launchctl kickstart -kp system/com.apple.loginwindow 2>/dev/null || true
+          sleep 8
+
+          # Method 2: If loginwindow did not respond, force the GUI user's session
+          # without touching loginwindow
+          sudo launchctl asuser $(id -u $GUI_USER 2>/dev/null || echo 550) launchctl load -S Aqua /System/Library/LaunchAgents/com.apple.Finder.plist 2>/dev/null || true
+          sudo launchctl asuser $(id -u $GUI_USER 2>/dev/null || echo 550) launchctl load -S Aqua /System/Library/LaunchAgents/com.apple.Dock.plist 2>/dev/null || true
+          sleep 4
+
+          # Wake the display
+          caffeinate -u -t 5 &
+          sleep 2
+
+          # Open apps to force desktop rendering
+          # (uses the current runner user, which already has a GUI session)
+          open -a Finder 2>/dev/null || true
+          sleep 2
+          open -a TextEdit 2>/dev/null || true
+          sleep 1
+
+          # Permanent caffeinate
+          caffeinate -dims &
+
+          # --------------------------------------------------
+          # VERIFICATION
+          # --------------------------------------------------
+          echo "=== GUI system status ==="
+          pgrep -x WindowServer > /dev/null && echo "WindowServer running (PID: $(pgrep -x WindowServer))" || echo "WindowServer not found"
+          pgrep -x Dock         > /dev/null && echo "Dock running"                                         || echo "Dock not running"
+          pgrep -x Finder       > /dev/null && echo "Finder running"                                       || echo "Finder not running"
+          pgrep loginwindow     > /dev/null && echo "loginwindow running"                                  || echo "loginwindow not running"
+
+          # Screenshot test (may fail because of TCC, but VNC can still work)
+          screencapture /tmp/test_display.png 2>/dev/null
+          if [ -f /tmp/test_display.png ] && [ "$(stat -f%z /tmp/test_display.png 2>/dev/null)" -gt 1000 ]; then
+            echo "Display is rendering (screenshot $(stat -f%z /tmp/test_display.png) bytes)"
+          else
+            echo "screencapture failed (likely TCC); VNC uses a different API and may still work"
+          fi
+
+      # -----------------------------------------------------
+      # 5. ENABLE VNC / SCREEN SHARING
+      # -----------------------------------------------------
+      - name: "Enable VNC and Screen Sharing"
+        run: |
+          echo ">>> Configuring Apple Remote Desktop + Legacy VNC..."
+
+          # Step 1: Configure ARD with Legacy VNC enabled
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -allowAccessFor -allUsers \
+            -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASSWORD" \
+            -restart -agent
+
+          # Step 2: Write the VNC password in obfuscated DES format
+          echo "$VNC_PASSWORD" | perl -we '
+            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" };
+            $_ = <>; chomp; s/^(.{8}).*/$1/;
+            @p = unpack "C*", $_;
+            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) };
+            print "\n"
+          ' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
+
+          # Step 3: Force Legacy VNC + console mode (key black-screen fix)
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsEnabled -bool true
+
+          # Step 4: Enable and load Screen Sharing
+          sudo launchctl enable system/com.apple.screensharing
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+
+          # Step 5: Restart the ARD agent attached to the console
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -restart -agent -console
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate
+
+          sleep 5
+
+          # Verify
+          echo "=== Verifying VNC port 5900 ==="
+          if lsof -i :5900 2>/dev/null | grep -q LISTEN; then
+            echo "VNC listening on port 5900"
+            lsof -i :5900
+          else
+            echo "Port 5900 is not listening yet. Waiting 10 more seconds..."
+            sleep 10
+            if lsof -i :5900 2>/dev/null | grep -q LISTEN; then
+              echo "VNC listening on port 5900 (after additional wait)"
+            else
+              echo "VNC not detected on 5900:"
+              netstat -an | grep -E '590[0-9]' || echo "No active 590x port"
+              sudo launchctl list | grep -i screen || true
+            fi
+          fi
+
+      # -----------------------------------------------------
+      # 6. noVNC (BROWSER ACCESS)
+      # -----------------------------------------------------
+      - name: "Install noVNC + websockify"
+        run: |
+          pip3 install websockify --break-system-packages 2>/dev/null || \
+          pip3 install websockify 2>/dev/null || \
+          python3 -m pip install websockify
+
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
+
+          # Redirect root -> vnc.html with autoconnect
+          cat > /tmp/noVNC/index.html << 'REDIRECT'
+          <!DOCTYPE html>
+          <html>
+          <head><meta http-equiv="refresh" content="0;url=vnc.html?autoconnect=true&resize=scale"></head>
+          <body>Redirecting to noVNC...</body>
+          </html>
+          REDIRECT
+
+          websockify --web=/tmp/noVNC --heartbeat=30 6080 localhost:5900 &
+          sleep 3
+
+          if lsof -i :6080 2>/dev/null | grep -q LISTEN; then
+            echo "noVNC on port 6080"
+          else
+            python3 -m websockify --web=/tmp/noVNC --heartbeat=30 6080 localhost:5900 &
+            sleep 3
+            lsof -i :6080 || echo "websockify could not start"
+          fi
+
+      # -----------------------------------------------------
+      # 7. CLOUDFLARE TUNNEL (FREE PUBLIC URL)
+      # -----------------------------------------------------
+      - name: "Install cloudflared"
+        run: |
+          brew install cloudflare/cloudflare/cloudflared 2>/dev/null || \
+          brew install cloudflared 2>/dev/null || {
+            curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz" -o /tmp/cf.tgz
+            cd /tmp && tar xzf cf.tgz && sudo mv cloudflared /usr/local/bin/
+          }
+          cloudflared --version
+
+      - name: "Start Cloudflare Tunnel (browser noVNC)"
+        run: |
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for Cloudflare URL..."
+          NOVNC_URL=""
+          for i in $(seq 1 40); do
+            NOVNC_URL=$(grep -oE 'https://[a-zA-Z0-9._-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$NOVNC_URL" ]; then
+              echo "NOVNC_URL=$NOVNC_URL" >> $GITHUB_ENV
+              echo "Cloudflare Tunnel is ready!"
+              echo ""
+              echo "==================================================="
+              echo "  OPEN THIS IN YOUR BROWSER:"
+              echo "  $NOVNC_URL"
+              echo "  Password: $VNC_PASSWORD"
+              echo "==================================================="
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$NOVNC_URL" ]; then
+            echo "Cloudflare tunnel could not start"
+            tail -20 /tmp/cloudflared.log
+          fi
+
+      # -----------------------------------------------------
+      # 8. BORE.PUB (FREE DIRECT VNC TUNNEL)
+      # -----------------------------------------------------
+      - name: "Install and launch bore (direct VNC)"
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-aarch64-apple-darwin.tar.gz"
+          else
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-apple-darwin.tar.gz"
+          fi
+
+          curl -sL "$BORE_URL" -o /tmp/bore.tar.gz
+          cd /tmp && tar xzf bore.tar.gz
+          sudo mv /tmp/bore /usr/local/bin/ 2>/dev/null || true
+          chmod +x /usr/local/bin/bore 2>/dev/null || true
+
+          bore local 5900 --to bore.pub > /tmp/bore.log 2>&1 &
+
+          BORE_ADDR=""
+          for i in $(seq 1 25); do
+            BORE_ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1)
+            if [ -n "$BORE_ADDR" ]; then
+              echo "BORE_VNC=$BORE_ADDR" >> $GITHUB_ENV
+              echo "Direct VNC: $BORE_ADDR"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$BORE_ADDR" ]; then
+            echo "bore is not available"
+            tail -10 /tmp/bore.log
+          fi
+
+      # -----------------------------------------------------
+      # 9. SSH VIA TMATE (BACKUP)
+      # -----------------------------------------------------
+      - name: "SSH with tmate"
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 350
+        with:
+          detached: true
+
+      # -----------------------------------------------------
+      # 10. DEVELOPMENT TOOLS
+      # -----------------------------------------------------
+      - name: "Configure Xcode + Simulator"
+        run: |
+          sudo xcodebuild -license accept 2>/dev/null || true
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer 2>/dev/null || true
+
+          DEVICE_UUID=$(xcrun simctl list devices available | grep "iPhone 16 Pro (" | head -1 | grep -oE '[A-F0-9-]{36}')
+          if [ -n "$DEVICE_UUID" ]; then
+            xcrun simctl boot "$DEVICE_UUID" 2>/dev/null || true
+            open -a Simulator 2>/dev/null || true
+            echo "Simulator: iPhone 16 Pro ($DEVICE_UUID)"
+          else
+            echo "iPhone 16 Pro not found:"
+            xcrun simctl list devices available | head -20
+          fi
+
+      - name: "Install .NET MAUI (optional)"
+        continue-on-error: true
+        run: |
+          command -v dotnet &>/dev/null && echo "dotnet $(dotnet --version)" || brew install --cask dotnet-sdk || true
+          sudo dotnet workload install maui ios maccatalyst --skip-manifest-update 2>/dev/null || true
+          echo ".NET MAUI configured"
+
+      - name: "Install Java + CocoaPods (optional)"
+        continue-on-error: true
+        run: |
+          brew install openjdk@17 2>/dev/null || true
+          sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-17.jdk 2>/dev/null || true
+          sudo gem install cocoapods 2>/dev/null || true
+          echo "Java + CocoaPods configured"
+
+      # -----------------------------------------------------
+      # 11. CONNECTION SUMMARY
+      # -----------------------------------------------------
+      - name: "=== HOW TO CONNECT ==="
+        run: |
+          echo ""
+          echo "=================================================================="
+          echo "       macOS REMOTE DESKTOP - READY TO USE"
+          echo "=================================================================="
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION A: BROWSER (RECOMMENDED) - Install NOTHING"
+          echo "----------------------------------------------------------------"
+          if [ -n "$NOVNC_URL" ]; then
+            echo "  1. Open in Chrome/Edge/Firefox:"
+            echo "     $NOVNC_URL"
+            echo "  2. Password: $VNC_PASSWORD"
+            echo ""
+            echo "  If you see a LOGIN screen, use:"
+            echo "     User: $GUI_USER"
+            echo "     Password: $GUI_PASS"
+          else
+            echo "  (Cloudflare is not available)"
+          fi
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION B: VNC CLIENT (TightVNC / RealVNC Viewer)"
+          echo "----------------------------------------------------------------"
+          if [ -n "$BORE_VNC" ]; then
+            echo "  Server: $BORE_VNC"
+            echo "  Password: $VNC_PASSWORD"
+          else
+            echo "  (bore is not available)"
+          fi
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION C: SSH"
+          echo "----------------------------------------------------------------"
+          echo "  See the 'SSH with tmate' step above for the command."
+          echo ""
+          echo "=================================================================="
+
+      - name: "Write Summary"
+        run: |
+          echo "## macOS Remote Desktop" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$NOVNC_URL" ]; then
+            echo "### Browser (Recommended)" >> $GITHUB_STEP_SUMMARY
+            echo "**[Open macOS in the browser]($NOVNC_URL)**" >> $GITHUB_STEP_SUMMARY
+            echo "VNC password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+            echo "macOS login: \`$GUI_USER\` / \`$GUI_PASS\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$BORE_VNC" ]; then
+            echo "### VNC Client" >> $GITHUB_STEP_SUMMARY
+            echo "Server: \`$BORE_VNC\` | Password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### SSH: see the *SSH with tmate* step" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Tools:** Xcode, iOS Simulator, .NET MAUI, Java 17, CocoaPods" >> $GITHUB_STEP_SUMMARY
+          echo "> Session active for ~6 hours. Cancel the workflow to stop it." >> $GITHUB_STEP_SUMMARY
+
+      # -----------------------------------------------------
+      # 12. KEEP ALIVE
+      # -----------------------------------------------------
+      - name: "Keep alive (6 hours)"
+        run: |
+          echo "Session is active. Cancel the workflow when you are done."
+          sleep 21600
