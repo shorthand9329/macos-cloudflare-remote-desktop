@@ -63,57 +63,101 @@ jobs:
       # -----------------------------------------------------
       - name: "Create 1920x1080 Virtual Display"
         run: |
-          cat > /tmp/create-display.swift << 'SWIFTEOF'
-          import CoreGraphics
-          import Foundation
+          cat > /tmp/create-display.m << 'OBJC_EOF'
+          #import <Foundation/Foundation.h>
+          #import <CoreGraphics/CoreGraphics.h>
+          #include <signal.h>
 
-          // --- Descriptor ---
-          let desc = CGVirtualDisplayDescriptor()
-          desc.queue = DispatchQueue.main
-          desc.name = "GitHub Actions Display"
-          desc.maxPixelsWide = 1920
-          desc.maxPixelsHigh = 1080
-          desc.sizeInMillimeters = CGSize(width: 597, height: 336)
-          desc.productID = 0xDA1F
-          desc.vendorID  = 0xDA10
-          desc.serialNum = 0x0001
+          @interface CGVirtualDisplayDescriptor : NSObject
+          @property(nonatomic) dispatch_queue_t queue;
+          @property(nonatomic, copy) NSString *name;
+          @property(nonatomic) uint32_t maxPixelsWide;
+          @property(nonatomic) uint32_t maxPixelsHigh;
+          @property(nonatomic) CGSize sizeInMillimeters;
+          @property(nonatomic) uint32_t productID;
+          @property(nonatomic) uint32_t vendorID;
+          @property(nonatomic) uint32_t serialNum;
+          @end
 
-          guard let display = CGVirtualDisplay(descriptor: desc) else {
-              fputs("ERROR: CGVirtualDisplay init returned nil\n", stderr)
-              exit(1)
+          @interface CGVirtualDisplayMode : NSObject
+          @property(nonatomic) uint32_t width;
+          @property(nonatomic) uint32_t height;
+          @property(nonatomic) double refreshRate;
+          @end
+
+          @interface CGVirtualDisplaySettings : NSObject
+          @property(nonatomic, copy) NSArray *modes;
+          @property(nonatomic) BOOL hiDPI;
+          @end
+
+          @interface CGVirtualDisplay : NSObject
+          - (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
+          @property(nonatomic, readonly) CGDirectDisplayID displayID;
+          - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
+          @end
+
+          int main(void) {
+            @autoreleasepool {
+              Class descriptorClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
+              Class displayClass = NSClassFromString(@"CGVirtualDisplay");
+              Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+              Class settingsClass = NSClassFromString(@"CGVirtualDisplaySettings");
+
+              if (!descriptorClass || !displayClass || !modeClass || !settingsClass) {
+                fprintf(stderr, "ERROR: CGVirtualDisplay runtime classes are not available on this macOS image\n");
+                return 1;
+              }
+
+              CGVirtualDisplayDescriptor *desc = [descriptorClass new];
+              desc.queue = dispatch_get_main_queue();
+              desc.name = @"GitHub Actions Display";
+              desc.maxPixelsWide = 1920;
+              desc.maxPixelsHigh = 1080;
+              desc.sizeInMillimeters = CGSizeMake(597, 336);
+              desc.productID = 0xDA1F;
+              desc.vendorID = 0xDA10;
+              desc.serialNum = 0x0001;
+
+              CGVirtualDisplay *display = [[displayClass alloc] initWithDescriptor:desc];
+              if (!display) {
+                fprintf(stderr, "ERROR: CGVirtualDisplay init returned nil\n");
+                return 1;
+              }
+
+              CGVirtualDisplayMode *mode = [modeClass new];
+              mode.width = 1920;
+              mode.height = 1080;
+              mode.refreshRate = 60.0;
+
+              CGVirtualDisplaySettings *settings = [settingsClass new];
+              settings.modes = @[mode];
+              settings.hiDPI = NO;
+
+              BOOL ok = [display applySettings:settings];
+              printf("DISPLAY_ID=%u\n", display.displayID);
+              printf("RESOLUTION=1920x1080@60\n");
+              printf("SETTINGS_APPLIED=%s\n", ok ? "true" : "false");
+
+              CGDisplayConfigRef config = NULL;
+              if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
+                CGConfigureDisplayOrigin(config, display.displayID, 0, 0);
+                CGError result = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+                printf("SET_AS_MAIN=%s\n", result == kCGErrorSuccess ? "true" : "false");
+              }
+
+              signal(SIGINT, SIG_IGN);
+              signal(SIGTERM, SIG_IGN);
+              [[NSRunLoop mainRunLoop] run];
+            }
+            return 0;
           }
-
-          // --- Mode 1920x1080 @ 60 Hz ---
-          let mode = CGVirtualDisplayMode()
-          mode.width  = 1920
-          mode.height = 1080
-          mode.refreshRate = 60.0
-
-          let settings = CGVirtualDisplaySettings()
-          settings.modes = [mode]
-          settings.hiDPI = 0
-
-          let ok = display.applySettings(settings)
-          print("DISPLAY_ID=\(display.displayID)")
-          print("RESOLUTION=1920x1080@60")
-          print("SETTINGS_APPLIED=\(ok)")
-
-          // --- Try to make it the main display ---
-          var config: CGDisplayConfigRef?
-          if CGBeginDisplayConfiguration(&config) == .success {
-              CGConfigureDisplayOrigin(config!, display.displayID, 0, 0)
-              let result = CGCompleteDisplayConfiguration(config!, .forSession)
-              print("SET_AS_MAIN=\(result == .success)")
-          }
-
-          // Keep the process alive indefinitely
-          signal(SIGINT,  SIG_IGN)
-          signal(SIGTERM, SIG_IGN)
-          dispatchMain()
-          SWIFTEOF
+          OBJC_EOF
 
           echo ">>> Compiling virtual display helper..."
-          if swiftc -O /tmp/create-display.swift -o /tmp/create-display 2>/tmp/swift-error.log; then
+          if clang -ObjC -fobjc-arc /tmp/create-display.m \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -o /tmp/create-display 2>/tmp/display-compile-error.log; then
             echo "Compiled OK"
             /tmp/create-display > /tmp/display-output.log 2>&1 &
             VDPID=$!
@@ -127,8 +171,8 @@ jobs:
               cat /tmp/display-output.log
             fi
           else
-            echo "Swift compilation failed (macOS $(sw_vers -productVersion)):"
-            cat /tmp/swift-error.log
+            echo "Objective-C compilation failed (macOS $(sw_vers -productVersion)):"
+            cat /tmp/display-compile-error.log
             echo ""
             echo ">>> Continuing without a virtual display..."
           fi
@@ -349,8 +393,7 @@ jobs:
             tail -20 /tmp/cloudflared.log
           fi
 
-
-
+ 
       # -----------------------------------------------------
       # 11. CONNECTION SUMMARY
       # -----------------------------------------------------
