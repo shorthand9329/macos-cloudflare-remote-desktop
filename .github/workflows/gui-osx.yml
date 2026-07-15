@@ -80,9 +80,7 @@ jobs:
           @end
 
           @interface CGVirtualDisplayMode : NSObject
-          @property(nonatomic) uint32_t width;
-          @property(nonatomic) uint32_t height;
-          @property(nonatomic) double refreshRate;
+          - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height refreshRate:(double)refreshRate;
           @end
 
           @interface CGVirtualDisplaySettings : NSObject
@@ -124,10 +122,11 @@ jobs:
                 return 1;
               }
 
-              CGVirtualDisplayMode *mode = [modeClass new];
-              mode.width = 1920;
-              mode.height = 1080;
-              mode.refreshRate = 60.0;
+              CGVirtualDisplayMode *mode = [[modeClass alloc] initWithWidth:1920 height:1080 refreshRate:60.0];
+              if (!mode) {
+                fprintf(stderr, "ERROR: CGVirtualDisplayMode init returned nil\n");
+                return 1;
+              }
 
               CGVirtualDisplaySettings *settings = [settingsClass new];
               settings.modes = @[mode];
@@ -393,9 +392,42 @@ jobs:
             tail -20 /tmp/cloudflared.log
           fi
 
- 
       # -----------------------------------------------------
-      # 11. CONNECTION SUMMARY
+      # 8. BORE.PUB (FREE DIRECT VNC TUNNEL)
+      # -----------------------------------------------------
+      - name: "Install and launch bore (direct VNC)"
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-aarch64-apple-darwin.tar.gz"
+          else
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-apple-darwin.tar.gz"
+          fi
+
+          curl -sL "$BORE_URL" -o /tmp/bore.tar.gz
+          cd /tmp && tar xzf bore.tar.gz
+          sudo mv /tmp/bore /usr/local/bin/ 2>/dev/null || true
+          chmod +x /usr/local/bin/bore 2>/dev/null || true
+
+          bore local 5900 --to bore.pub > /tmp/bore.log 2>&1 &
+
+          BORE_ADDR=""
+          for i in $(seq 1 25); do
+            BORE_ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1)
+            if [ -n "$BORE_ADDR" ]; then
+              echo "BORE_VNC=$BORE_ADDR" >> $GITHUB_ENV
+              echo "Direct VNC: $BORE_ADDR"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$BORE_ADDR" ]; then
+            echo "bore is not available"
+            tail -10 /tmp/bore.log
+          fi
+
+      # -----------------------------------------------------
+      # 9. CONNECTION SUMMARY
       # -----------------------------------------------------
       - name: "=== HOW TO CONNECT ==="
         run: |
@@ -430,10 +462,6 @@ jobs:
           fi
           echo ""
           echo "----------------------------------------------------------------"
-          echo "  OPTION C: SSH"
-          echo "----------------------------------------------------------------"
-          echo "  See the 'SSH with tmate' step above for the command."
-          echo ""
           echo "=================================================================="
 
       - name: "Write Summary"
@@ -452,13 +480,11 @@ jobs:
             echo "Server: \`$BORE_VNC\` | Password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### SSH: see the *SSH with tmate* step" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "**Tools:** Xcode, iOS Simulator, .NET MAUI, Java 17, CocoaPods" >> $GITHUB_STEP_SUMMARY
           echo "> Session active for ~6 hours. Cancel the workflow to stop it." >> $GITHUB_STEP_SUMMARY
 
       # -----------------------------------------------------
-      # 12. KEEP ALIVE
+      # 10. KEEP ALIVE
       # -----------------------------------------------------
       - name: "Keep alive (6 hours)"
         run: |
