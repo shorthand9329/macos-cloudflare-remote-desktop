@@ -208,7 +208,9 @@ jobs:
 
           # Create /etc/kcpassword (XOR-encoded password for auto-login)
           echo ">>> Generating kcpassword..."
-          if [ ! -f "$HOME/bootstrap/kcpassword.py" ]; then
+          if [ -f "$HOME/bootstrap/kcpassword.py" ]; then
+            sudo python3 "$HOME/bootstrap/kcpassword.py" "mac2026A"
+          else
             mkdir -p "$HOME/bootstrap"
             cat > "$HOME/bootstrap/kcpassword.py" << 'PY'
           import sys
@@ -219,12 +221,12 @@ jobs:
           encoded = bytearray(ch ^ key[i % len(key)] for i, ch in enumerate(password))
           while len(encoded) % 12:
               encoded.append(0)
-          Path.home().joinpath("kcpassword").write_bytes(encoded)
+          Path("/tmp/kcpassword").write_bytes(encoded)
           print(f"kcpassword generated ({len(encoded)} bytes)")
           PY
+            python3 "$HOME/bootstrap/kcpassword.py" "mac2026A"
+            sudo cp /tmp/kcpassword /etc/kcpassword
           fi
-          python3 "$HOME/bootstrap/kcpassword.py" "mac2026A"
-          sudo cp "$HOME/kcpassword" /etc/kcpassword
           sudo chmod 600 /etc/kcpassword
           sudo chown root:wheel /etc/kcpassword
 
