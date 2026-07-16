@@ -1,0 +1,656 @@
+name: "macOS Remote Desktop (Runner User)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-runner-gui:
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    env:
+      VNC_PASSWORD: ${{ secrets.PASSWORD || 'mac2026A' }}
+      GUI_USER: runner
+      GUI_PASS: ${{ secrets.PASSWORD || 'mac2026A' }}
+
+    steps:
+      - name: "Mask remote desktop credentials"
+        run: |
+          echo "::add-mask::$VNC_PASSWORD"
+          echo "::add-mask::$GUI_PASS"
+
+      # -----------------------------------------------------
+      # 1. SYSTEM INFORMATION
+      # -----------------------------------------------------
+      - name: "System Information"
+        run: |
+          echo "=== macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) ==="
+          echo "Arch: $(uname -m)"
+          echo "CPU: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'Apple Silicon')"
+          echo "RAM: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          echo "Free disk: $(df -h / | tail -1 | awk '{print $4}')"
+          echo "Xcode: $(xcodebuild -version 2>/dev/null | head -1 || echo 'N/A')"
+          echo "--- Displays before configuration ---"
+          system_profiler SPDisplaysDataType 2>/dev/null | head -25 || true
+
+      # -----------------------------------------------------
+      # 2. USE THE EXISTING RUNNER USER WITH A KNOWN PASSWORD
+      # -----------------------------------------------------
+      - name: "Configure runner user password (${{ env.GUI_USER }})"
+        run: |
+          echo ">>> Reusing existing user '$GUI_USER' with a known password..."
+          if ! id "$GUI_USER" >/dev/null 2>&1; then
+            echo "User '$GUI_USER' does not exist on this runner"
+            exit 1
+          fi
+
+          sudo dscl . -passwd /Users/$GUI_USER "$GUI_PASS" 2>/dev/null || \
+          sudo sysadminctl -resetPasswordFor "$GUI_USER" -newPassword "$GUI_PASS" 2>/dev/null || true
+          sudo dscl . -append /Groups/admin GroupMembership "$GUI_USER" 2>/dev/null || true
+
+          if sudo dscl . -authonly "$GUI_USER" "$GUI_PASS" 2>/dev/null; then
+            echo "Runner user '$GUI_USER' password is configured"
+          else
+            echo "Could not verify the runner user password"
+            exit 1
+          fi
+
+      # -----------------------------------------------------
+      # 4. AUTO-LOGIN + DESKTOP GUI SESSION
+      # -----------------------------------------------------
+      - name: "Configure auto-login and GUI session"
+        run: |
+          # --------------------------------------------------
+          # DISABLE SLEEP / SCREENSAVER
+          # --------------------------------------------------
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 hibernatemode 0
+          sudo pmset -a autorestart 1
+          defaults write com.apple.screensaver idleTime 0
+          sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
+
+          # --------------------------------------------------
+          # CONFIGURE AUTO-LOGIN FOR $GUI_USER
+          # --------------------------------------------------
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "$GUI_USER"
+          sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool false
+
+          # Create /etc/kcpassword (XOR-encoded password for auto-login)
+          echo ">>> Generating kcpassword..."
+          if [ -f "$HOME/bootstrap/kcpassword.py" ]; then
+            sudo python3 "$HOME/bootstrap/kcpassword.py" "$GUI_PASS"
+          else
+            mkdir -p "$HOME/bootstrap"
+            cat > "$HOME/bootstrap/kcpassword.py" << 'PY'
+          import sys
+          from pathlib import Path
+
+          key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
+          password = (sys.argv[1] if len(sys.argv) > 1 else "").encode() + b"\x00"
+          encoded = bytearray(ch ^ key[i % len(key)] for i, ch in enumerate(password))
+          while len(encoded) % 12:
+              encoded.append(0)
+          Path("/tmp/kcpassword").write_bytes(encoded)
+          print(f"kcpassword generated ({len(encoded)} bytes)")
+          PY
+            python3 "$HOME/bootstrap/kcpassword.py" "$GUI_PASS"
+            sudo cp /tmp/kcpassword /etc/kcpassword
+          fi
+          sudo chmod 600 /etc/kcpassword
+          sudo chown root:wheel /etc/kcpassword
+
+          # --------------------------------------------------
+          # ACTIVATE THE GUI SESSION WITHOUT KILLING LOGINWINDOW
+          # (killall loginwindow kills the runner -> exit 143)
+          # launchctl kickstart is safe for the runner
+          # --------------------------------------------------
+          echo ">>> Activating GUI session..."
+
+          # Method 1: kickstart restarts loginwindow via launchd (does not kill the runner)
+          sudo launchctl kickstart -kp system/com.apple.loginwindow 2>/dev/null || true
+          sleep 8
+
+          GUI_UID="$(id -u "$GUI_USER" 2>/dev/null || echo 550)"
+
+          # Put the physical/virtual console on the GUI user before VNC binds to it.
+          sudo /System/Library/CoreServices/Menu\ Extras/User.menu/Contents/Resources/CGSession \
+            -switchToUserID "$GUI_UID" 2>/dev/null || true
+          sleep 5
+
+          # Method 2: If loginwindow did not respond, force the GUI user's Aqua agents
+          # without touching the runner process.
+          sudo launchctl asuser "$GUI_UID" launchctl load -S Aqua /System/Library/LaunchAgents/com.apple.Finder.plist 2>/dev/null || true
+          sudo launchctl asuser "$GUI_UID" launchctl load -S Aqua /System/Library/LaunchAgents/com.apple.Dock.plist 2>/dev/null || true
+          sleep 4
+
+          # Wake the display
+          caffeinate -u -t 5 &
+          sleep 2
+
+          # Open apps inside the GUI user's console session to force desktop rendering.
+          sudo launchctl asuser "$GUI_UID" sudo -u "$GUI_USER" open -a Finder 2>/dev/null || true
+          sleep 2
+          sudo launchctl asuser "$GUI_UID" sudo -u "$GUI_USER" open -a TextEdit 2>/dev/null || true
+          sleep 1
+
+          # Fallback for runner images where the runner user owns the only Aqua session.
+          open -a Finder 2>/dev/null || true
+          sleep 2
+          open -a TextEdit 2>/dev/null || true
+          sleep 1
+
+          # Permanent caffeinate
+          caffeinate -dims &
+
+          # --------------------------------------------------
+          # VERIFICATION
+          # --------------------------------------------------
+          echo "=== GUI system status ==="
+          pgrep -x WindowServer > /dev/null && echo "WindowServer running (PID: $(pgrep -x WindowServer))" || echo "WindowServer not found"
+          pgrep -x Dock         > /dev/null && echo "Dock running"                                         || echo "Dock not running"
+          pgrep -x Finder       > /dev/null && echo "Finder running"                                       || echo "Finder not running"
+          pgrep loginwindow     > /dev/null && echo "loginwindow running"                                  || echo "loginwindow not running"
+
+          # Screenshot test (may fail because of TCC, but VNC can still work)
+          screencapture /tmp/test_display.png 2>/dev/null
+          if [ -f /tmp/test_display.png ] && [ "$(stat -f%z /tmp/test_display.png 2>/dev/null)" -gt 1000 ]; then
+            echo "Display is rendering (screenshot $(stat -f%z /tmp/test_display.png) bytes)"
+          else
+            echo "screencapture failed (likely TCC); VNC uses a different API and may still work"
+          fi
+
+      # -----------------------------------------------------
+      # 5. GRANT SCREEN CAPTURE PERMISSIONS FOR REMOTE MANAGEMENT
+      # -----------------------------------------------------
+      - name: "Grant Screen Recording permission for VNC services"
+        run: |
+          echo ">>> Attempting to pre-authorize Screen Recording for Apple VNC services..."
+          sudo python3 - <<'PY'
+          import sqlite3
+          import time
+          from pathlib import Path
+
+          db_path = Path("/Library/Application Support/com.apple.TCC/TCC.db")
+          clients = [
+              ("com.apple.screensharing", 0),
+              ("com.apple.screensharing.agent", 0),
+              ("com.apple.RemoteManagement", 0),
+              ("com.apple.ARDAgent", 0),
+              ("/System/Library/CoreServices/RemoteManagement/ARDAgent.app", 1),
+              ("/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent", 1),
+              ("/System/Library/CoreServices/RemoteManagement/AppleVNCServer.bundle/Contents/MacOS/AppleVNCServer", 1),
+          ]
+          services = [
+              "kTCCServiceScreenCapture",
+              "kTCCServiceAccessibility",
+              "kTCCServicePostEvent",
+          ]
+
+          conn = sqlite3.connect(db_path)
+          cols = [row[1] for row in conn.execute("PRAGMA table_info(access)")]
+          now = int(time.time())
+
+          def value_for(col, service, client, client_type):
+              values = {
+                  "service": service,
+                  "client": client,
+                  "client_type": client_type,
+                  "auth_value": 2,
+                  "auth_reason": 4,
+                  "auth_version": 1,
+                  "allowed": 1,
+                  "prompt_count": 1,
+                  "flags": 0,
+                  "last_modified": now,
+                  "indirect_object_identifier_type": 0,
+                  "indirect_object_identifier": "UNUSED",
+              }
+              return values.get(col)
+
+          writable = [
+              c for c in cols
+              if c not in {"csreq", "policy_id", "indirect_object_code_identity", "pid", "pid_version", "boot_uuid", "last_reminded"}
+          ]
+          placeholders = ",".join("?" for _ in writable)
+          columns = ",".join(writable)
+
+          for service in services:
+              for client, client_type in clients:
+                  conn.execute(
+                      "DELETE FROM access WHERE service = ? AND client = ? AND client_type = ?",
+                      (service, client, client_type),
+                  )
+                  vals = [value_for(c, service, client, client_type) for c in writable]
+                  sql = f"INSERT INTO access ({columns}) VALUES ({placeholders})"
+                  conn.execute(sql, vals)
+                  print(f"authorized {service} for {client}")
+
+          conn.commit()
+          conn.close()
+          PY
+          sudo killall tccd 2>/dev/null || true
+
+      # -----------------------------------------------------
+      # 6. ENABLE VNC / SCREEN SHARING
+      # -----------------------------------------------------
+      - name: "Enable VNC/Screen Sharing"
+        run: |
+          echo ">>> Displays before starting VNC..."
+          system_profiler SPDisplaysDataType 2>/dev/null | head -40 || true
+
+          echo ">>> Enabling Apple Remote Desktop + Screen Sharing..."
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers
+
+          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist \
+            com.apple.screensharing -dict Disabled -bool false
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          echo "VNC/Screen Sharing enabled"
+
+      - name: "Set VNC Password (Legacy VNC)"
+        shell: bash
+        run: |
+          set -e
+          echo ">>> Setting Legacy VNC password..."
+
+          sudo mkdir -p /Library/Preferences
+
+          # Use kickstart to enable Legacy VNC and set the configured password.
+          echo "$VNC_PASSWORD" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -restart -agent -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD"
+
+          # Keep the console-oriented settings that reduce black-screen VNC sessions.
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsEnabled -bool true
+
+          sudo launchctl unload /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent -console || true
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+          sleep 5
+          echo "=== Verifying VNC port 5900 ==="
+          for i in $(seq 1 12); do
+            if python3 - <<'PY'
+          import socket
+          with socket.create_connection(("127.0.0.1", 5900), timeout=2) as sock:
+              banner = sock.recv(12)
+          print("VNC banner:", banner.decode("ascii", "replace").strip())
+          raise SystemExit(0 if banner.startswith(b"RFB ") else 1)
+          PY
+            then
+              echo "VNC is accepting RFB connections on 127.0.0.1:5900"
+              break
+            fi
+            echo "VNC is not ready yet; waiting..."
+            sleep 5
+          done
+
+          if ! netstat -an | grep -qE '(\*|127\.0\.0\.1)\.5900 .*LISTEN'; then
+            echo "VNC not detected on 5900:"
+            netstat -an | grep -E '590[0-9]' || echo "No active 590x port"
+            sudo launchctl list | grep -i screen || true
+          fi
+
+      # -----------------------------------------------------
+      # 6. noVNC (BROWSER ACCESS)
+      # -----------------------------------------------------
+      - name: "Install noVNC + websockify"
+        run: |
+          pip3 install websockify --break-system-packages 2>/dev/null || \
+          pip3 install websockify 2>/dev/null || \
+          python3 -m pip install websockify
+
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
+
+          # Redirect root -> vnc.html with autoconnect
+          cat > /tmp/noVNC/index.html << 'REDIRECT'
+          <!DOCTYPE html>
+          <html>
+          <head><meta http-equiv="refresh" content="0;url=vnc.html?autoconnect=true&resize=scale"></head>
+          <body>Redirecting to noVNC...</body>
+          </html>
+          REDIRECT
+
+          websockify --web=/tmp/noVNC --heartbeat=30 6080 localhost:5900 &
+          sleep 3
+
+          if lsof -i :6080 2>/dev/null | grep -q LISTEN; then
+            echo "noVNC on port 6080"
+          else
+            python3 -m websockify --web=/tmp/noVNC --heartbeat=30 6080 localhost:5900 &
+            sleep 3
+            lsof -i :6080 || echo "websockify could not start"
+          fi
+
+          echo "=== Verifying noVNC HTTP endpoint ==="
+          curl -fsS http://127.0.0.1:6080/ | head -5
+          curl -fsS "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale" | grep -qi "novnc" && \
+            echo "noVNC web UI is reachable" || \
+            echo "noVNC web UI returned unexpected content"
+
+      # -----------------------------------------------------
+      # 7. CLOUDFLARE TUNNEL (FREE PUBLIC URL)
+      # -----------------------------------------------------
+      - name: "Install cloudflared"
+        run: |
+          brew install cloudflare/cloudflare/cloudflared 2>/dev/null || \
+          brew install cloudflared 2>/dev/null || {
+            curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz" -o /tmp/cf.tgz
+            cd /tmp && tar xzf cf.tgz && sudo mv cloudflared /usr/local/bin/
+          }
+          cloudflared --version
+
+      - name: "Start Cloudflare Tunnel (browser noVNC)"
+        run: |
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for Cloudflare URL..."
+          NOVNC_URL=""
+          for i in $(seq 1 40); do
+            NOVNC_URL=$(grep -oE 'https://[a-zA-Z0-9._-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$NOVNC_URL" ]; then
+              echo "NOVNC_URL=$NOVNC_URL" >> $GITHUB_ENV
+              echo "Cloudflare Tunnel is ready!"
+              echo ""
+              echo "==================================================="
+              echo "  OPEN THIS IN YOUR BROWSER:"
+              echo "  $NOVNC_URL/vnc.html?autoconnect=true&resize=scale"
+              echo "  Password: $VNC_PASSWORD"
+              echo "==================================================="
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$NOVNC_URL" ]; then
+            echo "Cloudflare tunnel could not start"
+            tail -20 /tmp/cloudflared.log
+          fi
+
+      - name: "Start Cloudflare Tunnel (SSH)"
+        run: |
+          echo ">>> Enabling Remote Login (sshd)..."
+          sudo systemsetup -setremotelogin on 2>/dev/null || true
+          sudo launchctl enable system/com.openssh.sshd 2>/dev/null || true
+          sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+
+          echo "=== Verifying SSH on localhost:22 ==="
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 22 2>/dev/null; then
+              echo "SSH is listening on 127.0.0.1:22"
+              break
+            fi
+            sleep 2
+          done
+
+          cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > /tmp/cloudflared-ssh.log 2>&1 &
+
+          echo "Waiting for SSH Cloudflare URL..."
+          SSH_URL=""
+          for i in $(seq 1 40); do
+            SSH_URL=$(grep -oE 'https://[a-zA-Z0-9._-]+\.trycloudflare\.com' /tmp/cloudflared-ssh.log | head -1)
+            if [ -n "$SSH_URL" ]; then
+              SSH_HOST="${SSH_URL#https://}"
+              echo "SSH_URL=$SSH_URL" >> $GITHUB_ENV
+              echo "SSH_HOST=$SSH_HOST" >> $GITHUB_ENV
+              echo "Cloudflare SSH Tunnel is ready!"
+              echo ""
+              echo "==================================================="
+              echo "  SSH VIA CLOUDFLARED:"
+              echo "  cloudflared access ssh --hostname $SSH_HOST"
+              echo "  ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST"
+              echo "  macOS login: $GUI_USER"
+              echo "==================================================="
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$SSH_URL" ]; then
+            echo "SSH Cloudflare tunnel could not start"
+            tail -20 /tmp/cloudflared-ssh.log
+          fi
+
+      - name: "Prepare noVNC connection artifact"
+        run: |
+          mkdir -p /tmp/novnc-connection
+          {
+            echo "noVNC:"
+            echo "$NOVNC_URL/vnc.html?autoconnect=true&resize=scale"
+            echo "VNC password: $VNC_PASSWORD"
+            echo "macOS login: $GUI_USER / $GUI_PASS"
+            echo ""
+            echo "SSH:"
+            if [ -n "${SSH_HOST:-}" ]; then
+              echo "cloudflared access ssh --hostname $SSH_HOST"
+              echo "ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST"
+              echo "macOS login: $GUI_USER / $GUI_PASS"
+            else
+              echo "SSH Cloudflare tunnel unavailable"
+            fi
+          } > /tmp/novnc-connection/connection.txt
+
+      - name: "Upload noVNC connection artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: novnc-connection-info
+          path: /tmp/novnc-connection/connection.txt
+          retention-days: 1
+
+      - name: "Self-test noVNC and VNC bridge"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NOVNC_URL:-}" ]; then
+            echo "NOVNC_URL is empty; Cloudflare tunnel did not become ready"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import base64
+          import os
+          import socket
+          import sys
+          import time
+          import urllib.request
+
+          def fail(message):
+              print(f"SELFTEST_FAIL: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def read_exact(sock, size):
+              data = b""
+              while len(data) < size:
+                  chunk = sock.recv(size - len(data))
+                  if not chunk:
+                      raise EOFError(f"socket closed after {len(data)} of {size} bytes")
+                  data += chunk
+              return data
+
+          novnc_url = os.environ["NOVNC_URL"].rstrip("/")
+          page_url = f"{novnc_url}/vnc.html?autoconnect=true&resize=scale"
+
+          last_error = None
+          for _ in range(12):
+              try:
+                  with urllib.request.urlopen(page_url, timeout=10) as response:
+                      body = response.read(300000).decode("utf-8", "replace")
+                  if "noVNC" not in body:
+                      fail("Cloudflare URL responded, but body does not look like noVNC")
+                  print("SELFTEST_OK: public noVNC HTML loaded through Cloudflare")
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(2)
+          else:
+              print(f"SELFTEST_WARN: public noVNC page was not reachable from the runner: {last_error}")
+
+          try:
+              with socket.create_connection(("127.0.0.1", 5900), timeout=10) as sock:
+                  banner = read_exact(sock, 12)
+              if not banner.startswith(b"RFB "):
+                  fail(f"VNC backend returned unexpected banner: {banner!r}")
+              print(f"SELFTEST_OK: VNC backend banner is {banner.decode('ascii', 'replace').strip()}")
+          except Exception as exc:
+              fail(f"could not read VNC backend banner: {exc}")
+
+          try:
+              key = base64.b64encode(os.urandom(16)).decode("ascii")
+              request = (
+                  "GET /websockify HTTP/1.1\r\n"
+                  "Host: 127.0.0.1:6080\r\n"
+                  "Upgrade: websocket\r\n"
+                  "Connection: Upgrade\r\n"
+                  "Sec-WebSocket-Version: 13\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\n"
+                  "\r\n"
+              ).encode("ascii")
+
+              with socket.create_connection(("127.0.0.1", 6080), timeout=10) as sock:
+                  sock.sendall(request)
+                  headers = b""
+                  while b"\r\n\r\n" not in headers:
+                      headers += sock.recv(4096)
+                      if len(headers) > 65536:
+                          fail("websockify response headers too large")
+
+                  status = headers.split(b"\r\n", 1)[0]
+                  if b" 101 " not in status:
+                      fail(f"websockify did not switch protocols: {status!r}")
+
+                  first = read_exact(sock, 2)
+                  length = first[1] & 0x7F
+                  if length == 126:
+                      length = int.from_bytes(read_exact(sock, 2), "big")
+                  elif length == 127:
+                      length = int.from_bytes(read_exact(sock, 8), "big")
+                  payload = read_exact(sock, length)
+
+              if not payload.startswith(b"RFB "):
+                  fail(f"websockify connected, but first payload was not VNC RFB: {payload[:32]!r}")
+              print(f"SELFTEST_OK: websockify bridges to VNC banner {payload.decode('ascii', 'replace').strip()}")
+          except Exception as exc:
+              fail(f"websockify/VNC bridge test failed: {exc}")
+          PY
+
+      # -----------------------------------------------------
+      # 8. BORE.PUB (FREE DIRECT VNC TUNNEL)
+      # -----------------------------------------------------
+      - name: "Install and launch bore (direct VNC)"
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-aarch64-apple-darwin.tar.gz"
+          else
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-apple-darwin.tar.gz"
+          fi
+
+          curl -sL "$BORE_URL" -o /tmp/bore.tar.gz
+          cd /tmp && tar xzf bore.tar.gz
+          sudo mv /tmp/bore /usr/local/bin/ 2>/dev/null || true
+          chmod +x /usr/local/bin/bore 2>/dev/null || true
+
+          bore local 5900 --to bore.pub > /tmp/bore.log 2>&1 &
+
+          BORE_ADDR=""
+          for i in $(seq 1 25); do
+            BORE_ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1)
+            if [ -n "$BORE_ADDR" ]; then
+              echo "BORE_VNC=$BORE_ADDR" >> $GITHUB_ENV
+              echo "Direct VNC: $BORE_ADDR"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$BORE_ADDR" ]; then
+            echo "bore is not available"
+            tail -10 /tmp/bore.log
+          fi
+
+      # -----------------------------------------------------
+      # 9. CONNECTION SUMMARY
+      # -----------------------------------------------------
+      - name: "=== HOW TO CONNECT ==="
+        run: |
+          echo ""
+          echo "=================================================================="
+          echo "       macOS REMOTE DESKTOP - READY TO USE"
+          echo "=================================================================="
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION A: BROWSER (RECOMMENDED) - Install NOTHING"
+          echo "----------------------------------------------------------------"
+          if [ -n "$NOVNC_URL" ]; then
+            echo "  1. Open in Chrome/Edge/Firefox:"
+            echo "     $NOVNC_URL/vnc.html?autoconnect=true&resize=scale"
+            echo "  2. Password: $VNC_PASSWORD"
+            echo ""
+            echo "  If you see a LOGIN screen, use:"
+            echo "     User: $GUI_USER"
+            echo "     Password: $GUI_PASS"
+          else
+            echo "  (Cloudflare is not available)"
+          fi
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION B: VNC CLIENT (TightVNC / RealVNC Viewer)"
+          echo "----------------------------------------------------------------"
+          if [ -n "$BORE_VNC" ]; then
+            echo "  Server: $BORE_VNC"
+            echo "  Password: $VNC_PASSWORD"
+          else
+            echo "  (bore is not available)"
+          fi
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "  OPTION C: SSH VIA CLOUDFLARED"
+          echo "----------------------------------------------------------------"
+          if [ -n "$SSH_HOST" ]; then
+            echo "  Command:"
+            echo "     cloudflared access ssh --hostname $SSH_HOST"
+            echo "     ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST"
+            echo "  macOS login:"
+            echo "     $GUI_USER / $GUI_PASS"
+          else
+            echo "  (SSH Cloudflare tunnel is not available)"
+          fi
+          echo ""
+          echo "----------------------------------------------------------------"
+          echo "=================================================================="
+
+      - name: "Write Summary"
+        run: |
+          echo "## macOS Remote Desktop" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$NOVNC_URL" ]; then
+            echo "### Browser (Recommended)" >> $GITHUB_STEP_SUMMARY
+            echo "**[Open macOS in the browser]($NOVNC_URL/vnc.html?autoconnect=true&resize=scale)**" >> $GITHUB_STEP_SUMMARY
+            echo "VNC password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+            echo "macOS login: \`$GUI_USER\` / \`$GUI_PASS\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$BORE_VNC" ]; then
+            echo "### VNC Client" >> $GITHUB_STEP_SUMMARY
+            echo "Server: \`$BORE_VNC\` | Password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$SSH_HOST" ]; then
+            echo "### SSH via Cloudflare" >> $GITHUB_STEP_SUMMARY
+            echo "\`cloudflared access ssh --hostname $SSH_HOST\`" >> $GITHUB_STEP_SUMMARY
+            echo "\`ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST\`" >> $GITHUB_STEP_SUMMARY
+            echo "macOS login: \`$GUI_USER\` / \`$GUI_PASS\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "> Session active for ~6 hours. Cancel the workflow to stop it." >> $GITHUB_STEP_SUMMARY
+
+      # -----------------------------------------------------
+      # 10. KEEP ALIVE
+      # -----------------------------------------------------
+      - name: "Keep alive (6 hours)"
+        run: |
+          echo "Session is active. Cancel the workflow when you are done."
+          sleep 21600
