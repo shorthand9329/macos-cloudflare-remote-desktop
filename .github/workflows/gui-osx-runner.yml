@@ -34,26 +34,19 @@ jobs:
           system_profiler SPDisplaysDataType 2>/dev/null | head -25 || true
 
       # -----------------------------------------------------
-      # 2. USE THE EXISTING RUNNER USER WITH A KNOWN PASSWORD
+      # 2. USE THE EXISTING RUNNER USER
       # -----------------------------------------------------
-      - name: "Configure runner user password (${{ env.GUI_USER }})"
+      - name: "Verify existing runner user (${{ env.GUI_USER }})"
         run: |
-          echo ">>> Reusing existing user '$GUI_USER' with a known password..."
+          echo ">>> Reusing existing user '$GUI_USER' without creating a new account..."
           if ! id "$GUI_USER" >/dev/null 2>&1; then
             echo "User '$GUI_USER' does not exist on this runner"
             exit 1
           fi
 
-          sudo dscl . -passwd /Users/$GUI_USER "$GUI_PASS" 2>/dev/null || \
-          sudo sysadminctl -resetPasswordFor "$GUI_USER" -newPassword "$GUI_PASS" 2>/dev/null || true
-          sudo dscl . -append /Groups/admin GroupMembership "$GUI_USER" 2>/dev/null || true
-
-          if sudo dscl . -authonly "$GUI_USER" "$GUI_PASS" 2>/dev/null; then
-            echo "Runner user '$GUI_USER' password is configured"
-          else
-            echo "Could not verify the runner user password"
-            exit 1
-          fi
+          id "$GUI_USER"
+          groups "$GUI_USER"
+          echo "Runner user exists. VNC will use the Legacy VNC password, not the system login password."
 
       # -----------------------------------------------------
       # 4. AUTO-LOGIN + DESKTOP GUI SESSION
@@ -75,29 +68,8 @@ jobs:
           sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false
           sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool false
 
-          # Create /etc/kcpassword (XOR-encoded password for auto-login)
-          echo ">>> Generating kcpassword..."
-          if [ -f "$HOME/bootstrap/kcpassword.py" ]; then
-            sudo python3 "$HOME/bootstrap/kcpassword.py" "$GUI_PASS"
-          else
-            mkdir -p "$HOME/bootstrap"
-            cat > "$HOME/bootstrap/kcpassword.py" << 'PY'
-          import sys
-          from pathlib import Path
-
-          key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
-          password = (sys.argv[1] if len(sys.argv) > 1 else "").encode() + b"\x00"
-          encoded = bytearray(ch ^ key[i % len(key)] for i, ch in enumerate(password))
-          while len(encoded) % 12:
-              encoded.append(0)
-          Path("/tmp/kcpassword").write_bytes(encoded)
-          print(f"kcpassword generated ({len(encoded)} bytes)")
-          PY
-            python3 "$HOME/bootstrap/kcpassword.py" "$GUI_PASS"
-            sudo cp /tmp/kcpassword /etc/kcpassword
-          fi
-          sudo chmod 600 /etc/kcpassword
-          sudo chown root:wheel /etc/kcpassword
+          echo ">>> Reusing the runner user's existing GUI login session."
+          echo "Skipping /etc/kcpassword because hosted runner's system password is not resettable."
 
           # --------------------------------------------------
           # ACTIVATE THE GUI SESSION WITHOUT KILLING LOGINWINDOW
@@ -420,13 +392,13 @@ jobs:
             echo "noVNC:"
             echo "$NOVNC_URL/vnc.html?autoconnect=true&resize=scale"
             echo "VNC password: $VNC_PASSWORD"
-            echo "macOS login: $GUI_USER / $GUI_PASS"
+            echo "macOS login: $GUI_USER (system password is not reset in runner-user mode)"
             echo ""
             echo "SSH:"
             if [ -n "${SSH_HOST:-}" ]; then
               echo "cloudflared access ssh --hostname $SSH_HOST"
               echo "ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST"
-              echo "macOS login: $GUI_USER / $GUI_PASS"
+              echo "macOS login: $GUI_USER (system password is not reset in runner-user mode)"
             else
               echo "SSH Cloudflare tunnel unavailable"
             fi
@@ -590,7 +562,7 @@ jobs:
             echo ""
             echo "  If you see a LOGIN screen, use:"
             echo "     User: $GUI_USER"
-            echo "     Password: $GUI_PASS"
+            echo "     Password: not reset in runner-user mode"
           else
             echo "  (Cloudflare is not available)"
           fi
@@ -613,7 +585,7 @@ jobs:
             echo "     cloudflared access ssh --hostname $SSH_HOST"
             echo "     ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST"
             echo "  macOS login:"
-            echo "     $GUI_USER / $GUI_PASS"
+            echo "     $GUI_USER (system password is not reset in runner-user mode)"
           else
             echo "  (SSH Cloudflare tunnel is not available)"
           fi
@@ -629,7 +601,7 @@ jobs:
             echo "### Browser (Recommended)" >> $GITHUB_STEP_SUMMARY
             echo "**[Open macOS in the browser]($NOVNC_URL/vnc.html?autoconnect=true&resize=scale)**" >> $GITHUB_STEP_SUMMARY
             echo "VNC password: \`$VNC_PASSWORD\`" >> $GITHUB_STEP_SUMMARY
-            echo "macOS login: \`$GUI_USER\` / \`$GUI_PASS\`" >> $GITHUB_STEP_SUMMARY
+            echo "macOS login: \`$GUI_USER\` (system password is not reset in runner-user mode)" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -n "$BORE_VNC" ]; then
@@ -641,7 +613,7 @@ jobs:
             echo "### SSH via Cloudflare" >> $GITHUB_STEP_SUMMARY
             echo "\`cloudflared access ssh --hostname $SSH_HOST\`" >> $GITHUB_STEP_SUMMARY
             echo "\`ssh -o ProxyCommand='cloudflared access ssh --hostname %h' $GUI_USER@$SSH_HOST\`" >> $GITHUB_STEP_SUMMARY
-            echo "macOS login: \`$GUI_USER\` / \`$GUI_PASS\`" >> $GITHUB_STEP_SUMMARY
+            echo "macOS login: \`$GUI_USER\` (system password is not reset in runner-user mode)" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
