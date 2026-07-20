@@ -1,0 +1,75 @@
+name: wwww
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+
+jobs:
+  ssh:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install SSH server
+      run: |
+        sudo apt update
+        sudo apt install -y openssh-server
+
+    - name: Set password for user
+      run: |
+        echo "runner:1qaz@WSX" | sudo chpasswd
+
+    - name: Enable SSH
+      run: |
+        sudo systemctl enable ssh
+        sudo systemctl start ssh
+
+    - name: Download cloudflared
+      run: |
+        wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared-linux-amd64
+        mv cloudflared-linux-amd64 cloudflared
+
+    - name: Start tunnel and send URL
+      env:
+        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      run: |
+        set -e
+
+        LOG=cloudflared.log
+
+        # 后台运行
+        nohup ./cloudflared tunnel --url tcp://localhost:22 > $LOG 2>&1 &
+
+        # 等待 URL
+        URL=""
+        for i in {1..60}; do
+          sleep 1
+          if [ -f "$LOG" ]; then
+            URL=$(grep -o 'https://[a-zA-Z0-9.-]*trycloudflare.com' $LOG | head -n 1 || true)
+            if [ ! -z "$URL" ]; then
+              break
+            fi
+          fi
+        done
+
+        if [ -z "$URL" ]; then
+          echo "Failed to obtain URL"
+          exit 1
+        fi
+
+        echo "Tunnel ready: $URL"
+
+        # 发送到 webhook（可选）
+        if [ ! -z "$WEBHOOK_URL" ]; then
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"text\":\"SSH Tunnel: $URL\"}" \
+            $WEBHOOK_URL
+        fi
+
+        echo "SSH is ready. Keeping runner alive..."
+        while true; do sleep 300; done
