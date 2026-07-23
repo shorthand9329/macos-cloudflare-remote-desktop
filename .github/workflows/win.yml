@@ -30,7 +30,7 @@ jobs:
         Invoke-WebRequest `
           -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe `
           -OutFile cloudflared.exe
-    - name: Start cloudflared in background and post URL
+    - name: Start cloudflared and show URL
       shell: pwsh
       env:
         WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -40,11 +40,15 @@ jobs:
         # 日志文件（只在 runner 本地）
         $log = "$PWD\cloudflared.log"
 
-        # 后台启动（关键：不用 Start-Process）
-        Start-Job -ScriptBlock {
-          & "$using:PWD\cloudflared.exe" tunnel --url tcp://localhost:3389 `
-            > "$using:log" 2>&1
-        } | Out-Null
+        # Start cloudflared in a separate process so this step can finish.
+        $command = "& '$PWD\cloudflared.exe' tunnel --url tcp://localhost:3389 *> '$log'"
+        $process = Start-Process `
+          -FilePath "pwsh" `
+          -ArgumentList @("-NoProfile", "-Command", $command) `
+          -WindowStyle Hidden `
+          -PassThru
+
+        "CLOUDFLARED_PID=$($process.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
         # 等待 trycloudflare URL
         $url = $null
@@ -76,6 +80,15 @@ jobs:
 
         $url
         "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+    - name: Keep runner alive
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        if ($env:CLOUDFLARED_PID) {
+          Write-Host "cloudflared process id: $env:CLOUDFLARED_PID"
+        }
 
         Write-Host "RDP is ready. Keeping runner alive..."
         while ($true) {
