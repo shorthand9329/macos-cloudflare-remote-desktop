@@ -70,6 +70,10 @@ jobs:
             -d "{\"text\":\"SSH Tunnel: $URL\"}" \
             $WEBHOOK_URL
         fi
-
+    - name: sleep
+      env:
+        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      run: |
+        set -e
         echo "SSH is ready. Keeping runner alive..."
         while true; do sleep 300; done
