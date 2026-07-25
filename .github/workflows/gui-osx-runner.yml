@@ -12,6 +12,8 @@ jobs:
       VNC_PASSWORD: ${{ secrets.PASSWORD || 'mac2026A' }}
       GUI_USER: runner
       GUI_PASS: ${{ secrets.PASSWORD || 'mac2026A' }}
+      DISPLAY_WIDTH: "2560"
+      DISPLAY_HEIGHT: "1440"
 
     steps:
       - name: "Mask remote desktop credentials"
@@ -132,7 +134,31 @@ jobs:
           fi
 
       # -----------------------------------------------------
-      # 5. GRANT SCREEN CAPTURE PERMISSIONS FOR REMOTE MANAGEMENT
+      # 5. DISPLAY RESOLUTION
+      # -----------------------------------------------------
+      - name: "Set display resolution"
+        run: |
+          echo ">>> Setting display resolution to ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}..."
+          brew install displayplacer 2>/dev/null || true
+
+          if command -v displayplacer >/dev/null 2>&1; then
+            displayplacer list || true
+            DISPLAY_ID="$(displayplacer list 2>/dev/null | awk -F'id:' '/Persistent screen id:/ {print $2; exit}' | awk '{print $1}')"
+            if [ -n "$DISPLAY_ID" ]; then
+              displayplacer "id:$DISPLAY_ID res:${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} hz:60 color_depth:8 scaling:off" || \
+              displayplacer "id:$DISPLAY_ID res:${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} scaling:off" || true
+            else
+              echo "Could not detect displayplacer display id"
+            fi
+          else
+            echo "displayplacer unavailable; keeping current display resolution"
+          fi
+
+          echo "--- Displays after resolution configuration ---"
+          system_profiler SPDisplaysDataType 2>/dev/null | head -60 || true
+
+      # -----------------------------------------------------
+      # 6. GRANT SCREEN CAPTURE PERMISSIONS FOR REMOTE MANAGEMENT
       # -----------------------------------------------------
       - name: "Grant Screen Recording permission for VNC services"
         run: |
