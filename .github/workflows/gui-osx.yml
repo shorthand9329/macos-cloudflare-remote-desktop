@@ -14,6 +14,8 @@ jobs:
       GUI_PASS: ${{ secrets.PASSWORD || 'mac2026A' }}
       DISPLAY_WIDTH: "2560"
       DISPLAY_HEIGHT: "1440"
+      DISPLAY_FALLBACK_WIDTH: "1920"
+      DISPLAY_FALLBACK_HEIGHT: "1080"
 
     steps:
       - name: "Mask remote desktop credentials"
@@ -180,7 +182,8 @@ jobs:
             DISPLAY_ID="$(displayplacer list 2>/dev/null | awk -F'id:' '/Persistent screen id:/ {print $2; exit}' | awk '{print $1}')"
             if [ -n "$DISPLAY_ID" ]; then
               displayplacer "id:$DISPLAY_ID res:${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} hz:60 color_depth:8 scaling:off" || \
-              displayplacer "id:$DISPLAY_ID res:${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} scaling:off" || true
+              displayplacer "id:$DISPLAY_ID res:${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} scaling:off" || \
+              displayplacer "id:$DISPLAY_ID res:${DISPLAY_FALLBACK_WIDTH}x${DISPLAY_FALLBACK_HEIGHT} scaling:off" || true
             else
               echo "Could not detect displayplacer display id"
             fi
