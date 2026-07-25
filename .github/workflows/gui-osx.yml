@@ -310,6 +310,10 @@ jobs:
 
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
 
+          # Apple Screen Sharing advertises ARD auth before Legacy VNC auth.
+          # Force noVNC to pick security type 2 so the browser uses only VNC_PASSWORD.
+          perl -0pi -e 's/this\._rfbAuthScheme = -1;\n            for \(let type of types\) \{\n                if \(this\._isSupportedSecurityType\(type\)\) \{\n                    this\._rfbAuthScheme = type;\n                    break;\n                \}\n            \}/this._rfbAuthScheme = types.includes(securityTypeVNCAuth) ? securityTypeVNCAuth : -1;\n            for (let type of types) {\n                if (this._rfbAuthScheme !== -1) {\n                    break;\n                }\n                if (this._isSupportedSecurityType(type)) {\n                    this._rfbAuthScheme = type;\n                    break;\n                }\n            }/' /tmp/noVNC/core/rfb.js
+
           # Redirect root -> vnc.html with autoconnect
           cat > /tmp/noVNC/index.html << 'REDIRECT'
           <!DOCTYPE html>
