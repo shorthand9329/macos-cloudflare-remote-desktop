@@ -24,94 +24,102 @@ jobs:
           -Name "fDenyTSConnections" -Value 0
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-    # 中文输入法（微软拼音）。三条经验：
-    #  1) shell 必须是 Windows PowerShell 5.1：International / LanguagePackManagement
-    #     是 Windows PowerShell 模块，PS7 下需要隐式远程。正文保持纯 ASCII。
-    #  2) Install-Language 在托管 runner 上会卡死在 Windows Update（实测 08:57→09:25
-    #     整整 28 分钟零输出、无异常），所以它只能带硬超时跑，整步还要 timeout-minutes
-    #     兜底，并且 continue-on-error，否则后面的 RDP 步骤会被默认的 if: success() 跳过。
-    #  3) 只做只读探测 + 注册语言列表；不调用 Get-WindowsCapability/Add-WindowsCapability
-    #     （同样走 Windows Update / DISM，同样会挂）。
-    - name: Chinese input method (Microsoft Pinyin, bounded)
+    # 中文输入法。实测事实（windows-2025-vs2026 = Server 2025 26100）：
+    #  1) 镜像自带微软拼音引擎（System32\InputMethod\CHS\ChsIME.exe）与 TIP 注册，但简体词典
+    #     来自 'basic typing' FOD（Language.Basic~~~zh-CN）：该镜像 NotPresent，且下载通道不可用
+    #     （Install-Language 无输出卡死 28 分钟；Add-WindowsCapability 240 秒零进展）。
+    #     没有词典，微软拼音无法把拼音转成汉字，所以真正能用的是自带词典的 RIME 小狼毫。
+    #  2) 小狼毫官方安装器：NSIS /S = 完全静默，并映射成 WeaselSetup /s（简体配置），
+    #     静默模式下自动跑 WeaselDeployer /deploy（见 output/install.nsi 292-323 行）。
+    #  3) shell 必须是 Windows PowerShell 5.1：International / LanguagePackManagement 是
+    #     Windows PowerShell 模块，PS7 下要隐式远程。正文保持纯 ASCII。
+    # 整步 timeout-minutes + continue-on-error：这一步永远不会拖住后面的 RDP 步骤。
+    - name: Chinese input method (RIME Weasel, bounded)
       shell: powershell
-      timeout-minutes: 6
+      timeout-minutes: 10
       continue-on-error: true
+      env:
+        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       run: |
         $ErrorActionPreference = "Continue"
         $lang = "zh-CN"
-
-        # Microsoft Pinyin input tip: 0804 = zh-CN keyboard layout, first GUID = IME
-        # CLSID, second GUID = language profile.
         $pinyinTip = "0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
-        $pinyinKey = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}\LanguageProfile\0x00000804\{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
-        $packTimeoutSec = 180
+        $weaselUrl = "https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.17.4.0-installer.exe"
+        $rimeUser = Join-Path $env:APPDATA "Rime"
         function Say($m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
 
-        Say "=== 1/5 inventory (read-only, no Windows Update calls) ==="
-        Say ("Microsoft Pinyin TIP already registered: {0}" -f (Test-Path $pinyinKey))
-        foreach ($p in @("$env:SystemRoot\System32\CHSIME.EXE", "$env:SystemRoot\System32\InputMethod\CHS\ChsIME.exe")) {
-          Say ("file {0} : {1}" -f $p, (Test-Path $p))
-        }
+        Say "=== 1/5 does this image ship the Simplified Chinese lexicons? ==="
+        $msLexicon = $false
         try {
-          foreach ($l in (Get-InstalledLanguage)) { Say ("installed language: {0}" -f $l.LanguageId) }
+          $msLexicon = [bool](Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages" -ErrorAction Stop |
+            Where-Object { $_.PSChildName -like "*LanguageFeatures-Basic-zh-*" } | Select-Object -First 1)
         } catch {
-          Say ("Get-InstalledLanguage failed: {0}" -f $_.Exception.Message)
+          Say ("lexicon probe failed: " + $_.Exception.Message)
         }
-        foreach ($e in (Get-WinUserLanguageList)) {
-          Say ("user language: {0} ({1}) tips={2}" -f $e.LanguageTag, $e.Autonym, ($e.InputMethodTips -join ','))
-        }
+        Say ("basic typing FOD for zh-CN installed: " + $msLexicon)
 
-        Say "=== 2/5 Windows Update stack (best effort) ==="
-        foreach ($n in @("wuauserv", "UsoSvc", "BITS", "DoSvc")) {
-          try {
-            Set-Service -Name $n -StartupType Manual -ErrorAction Stop
-            Start-Service -Name $n -ErrorAction Stop
-            Say ("{0}: {1}" -f $n, (Get-Service -Name $n).Status)
-          } catch {
-            Say ("{0}: cannot start - {1}" -f $n, $_.Exception.Message)
-          }
-        }
-
-        Say "=== 3/5 bounded pack install (max ${packTimeoutSec}s, then give up) ==="
-        if (Test-Path $pinyinKey) {
-          Say "Pinyin IME files are already on this image; nothing to download."
+        Say "=== 2/5 RIME Weasel (self-contained dictionaries, no Windows Update) ==="
+        $weasel = Get-ChildItem "$env:ProgramFiles\Rime" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($weasel) {
+          Say ("already installed: " + $weasel.FullName)
         } else {
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          $job = Start-Job -ScriptBlock { param($l) Install-Language -Language $l -ErrorAction Stop } -ArgumentList $lang
-          $finished = Wait-Job -Job $job -Timeout $packTimeoutSec
-          if ($finished) {
-            try {
-              Receive-Job -Job $job -ErrorAction Stop | Out-Null
-              Say ("Install-Language completed in {0}s" -f [int]$sw.Elapsed.TotalSeconds)
-            } catch {
-              Say ("Install-Language failed after {0}s: {1}" -f [int]$sw.Elapsed.TotalSeconds, $_.Exception.Message)
-            }
-          } else {
-            Say ("Install-Language produced nothing in {0}s -> abandoned (known hang: it waits on Windows Update forever)." -f $packTimeoutSec)
+          # The schema selection has to exist BEFORE the installer runs, so that its own
+          # silent WeaselDeployer /deploy compiles it (no second deploy needed).
+          New-Item -ItemType Directory -Force -Path $rimeUser | Out-Null
+          $cfgPath = Join-Path $rimeUser "default.custom.yaml"
+          if (-not (Test-Path -LiteralPath $cfgPath)) {
+            $cfg = "patch:`n  schema_list:`n    - schema: luna_pinyin_simp`n"
+            [System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding($false)))
+            Say ("pre-wrote " + $cfgPath + " -> luna_pinyin_simp (simplified output)")
           }
-          Stop-Job -Job $job -ErrorAction SilentlyContinue
-          Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-          Say ("Pinyin TIP registered after the attempt: {0}" -f (Test-Path $pinyinKey))
+          $exe = Join-Path $env:TEMP "weasel-installer.exe"
+          try {
+            Invoke-WebRequest -Uri $weaselUrl -OutFile $exe -UseBasicParsing -TimeoutSec 180
+            Say ("downloaded RIME installer: " + [int]((Get-Item -LiteralPath $exe).Length / 1MB) + " MB")
+            $p = Start-Process -FilePath $exe -ArgumentList "/S" -PassThru -WindowStyle Hidden
+            $null = Wait-Process -Id $p.Id -Timeout 300 -ErrorAction SilentlyContinue
+            if ($p.HasExited) {
+              Say ("RIME installer exit code: " + $p.ExitCode)
+            } else {
+              try { $p.Kill() } catch {}
+              Say "RIME installer timed out after 300s"
+            }
+          } catch {
+            Say ("RIME install failed: " + $_.Exception.Message)
+          }
+          $weasel = Get-ChildItem "$env:ProgramFiles\Rime" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
         }
 
-        Say "=== 4/5 register zh-CN for the current user ==="
+        Say "=== 3/5 discover the RIME TSF tip registered for zh-CN ==="
+        $weaselTip = $null
+        foreach ($k in (Get-ChildItem "HKLM:\SOFTWARE\Microsoft\CTF\TIP" -ErrorAction SilentlyContinue)) {
+          $clsid = $k.PSChildName
+          $dll = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+          if ($dll -and $dll -match "weasel") {
+            $profiles = Join-Path $k.PSPath "LanguageProfile\0x00000804"
+            if (Test-Path -LiteralPath $profiles) {
+              $prof = Get-ChildItem $profiles -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($prof) { $weaselTip = "0804:" + $clsid + $prof.PSChildName }
+            }
+          }
+        }
+        Say ("RIME tip for zh-CN: " + $weaselTip)
+
+        Say "=== 4/5 user language list (en-US default + usable Chinese IMEs) ==="
         try {
           $list = New-WinUserLanguageList -Language "en-US"
           $chinese = New-WinUserLanguageList -Language $lang
-          if (Test-Path $pinyinKey) {
-            $chinese[0].InputMethodTips.Clear()
-            $chinese[0].InputMethodTips.Add($pinyinTip)
-          } else {
-            Say "Pinyin TIP is missing, so the zh-CN entry keeps its default input methods only."
-          }
+          if ($msLexicon -or $weaselTip) { $chinese[0].InputMethodTips.Clear() }
+          if ($msLexicon) { $chinese[0].InputMethodTips.Add($pinyinTip) }
+          if ($weaselTip) { $chinese[0].InputMethodTips.Add($weaselTip) }
           $list.Add($chinese[0])
           Set-WinUserLanguageList -LanguageList $list -Force
-          Say "language list written: en-US (default) + $lang"
+          Say "language list written"
         } catch {
-          Say ("Set-WinUserLanguageList failed: {0}" -f $_.Exception.Message)
+          Say ("Set-WinUserLanguageList failed: " + $_.Exception.Message)
         }
 
-        Say "=== 5/5 input indicator (ctfmon) ==="
+        Say "=== 5/5 input indicator (ctfmon) + summary ==="
         try {
           $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
           if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
@@ -121,24 +129,40 @@ jobs:
           }
           Say "ctfmon autostart registered"
         } catch {
-          Say ("ctfmon setup failed: {0}" -f $_.Exception.Message)
+          Say ("ctfmon setup failed: " + $_.Exception.Message)
         }
 
-        Say "=== summary ==="
         $check = Get-WinUserLanguageList
         foreach ($e in $check) {
-          Say ("  {0} | {1} | {2}" -f $e.LanguageTag, $e.Autonym, ($e.InputMethodTips -join ' ; '))
+          Say ("  " + $e.LanguageTag + " | " + $e.Autonym + " | " + ($e.InputMethodTips -join " ; "))
         }
-        $imeReady = (Test-Path $pinyinKey) -and [bool]($check | Where-Object { $_.LanguageTag -eq $lang -and $_.InputMethodTips.Count -gt 0 })
-        if ($imeReady) {
-          Say "RESULT: Microsoft Pinyin is registered. After RDP login press Win+Space."
-        } else {
-          Say "RESULT: Microsoft Pinyin is NOT usable on this image."
-          Say "        The zh-CN entry may exist, but the IME files/dictionaries come from the"
-          Say "        'basic typing' FOD, which this image does not ship and cannot download"
-          Say "        (Windows Update hangs). Switch this step to a download-based IME (RIME/Weasel)."
+        $schemaList = "n/a"
+        $buildDefault = Join-Path $rimeUser "build\default.yaml"
+        if (Test-Path -LiteralPath $buildDefault) {
+          $schemaList = ((Select-String -Path $buildDefault -Pattern "^\s*- schema: (\S+)" -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }) -join ",")
         }
-        Say "This step deliberately never fails the job: RDP access matters more than the input method."
+        Say ("effective RIME schema_list: " + $schemaList)
+
+        $ready = [bool]($check | Where-Object { $_.LanguageTag -eq $lang -and $_.InputMethodTips.Count -gt 0 })
+        Say ("RESULT: " + $(if ($ready) { "Chinese IME registered (Win+Space -> RIME/Weasel)." } else { "no Chinese IME could be prepared." }))
+        Say "This step never fails the job: RDP access matters more than the input method."
+
+        if ($env:WEBHOOK_URL) {
+          try {
+            $body = @{
+              text        = "IME: ready=" + $ready + " rime_tip=" + $weaselTip + " schema_list=" + $schemaList + " ms_lexicon=" + $msLexicon
+              ime_ready   = $ready
+              rime_tip    = $weaselTip
+              schema_list = $schemaList
+              ms_lexicon  = $msLexicon
+            } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Method Post -Uri $env:WEBHOOK_URL -ContentType "application/json" -Body $body -TimeoutSec 30 | Out-Null
+            Say "IME status reported to the webhook"
+          } catch {
+            Say ("webhook report failed: " + $_.Exception.Message)
+          }
+        }
 
     - name: Download 
       shell: powershell
