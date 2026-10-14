@@ -1,7 +1,6 @@
 name: diag-ime
 
-# 临时诊断：只做只读探测，不调用任何会挂起的 Windows Update / DISM 安装接口，
-# 结束时立刻产出日志。用完即删。
+# 临时诊断（用完即删）：只做只读探测 + 一个有界的 FOD 安装尝试，结束即出日志。
 on:
   workflow_dispatch:
 
@@ -9,49 +8,69 @@ jobs:
   probe:
     runs-on: windows-latest
     steps:
-    - name: Probe Chinese IME availability (read-only, bounded)
+    - name: Probe IME dictionaries and bounded FOD install
       shell: powershell
-      timeout-minutes: 5
+      timeout-minutes: 8
       continue-on-error: true
       run: |
         $ErrorActionPreference = "Continue"
-        $pinyinKey = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}\LanguageProfile\0x00000804\{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
         function Say($m) { Write-Host ("PROBE " + $m) }
 
-        Say ("os: " + (Get-CimInstance Win32_OperatingSystem).Caption + " build " + [System.Environment]::OSVersion.Version)
-
-        Say ("TIP key path: " + $pinyinKey)
-        Say ("TIP key exists (LINUX-style Test-Path): " + (Test-Path -LiteralPath $pinyinKey))
-        Say ("TIP root exists: " + (Test-Path -LiteralPath "HKLM:\SOFTWARE\Microsoft\CTF\TIP\{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}"))
-        Say ("TIP root children: " + ((Get-ChildItem "HKLM:\SOFTWARE\Microsoft\CTF\TIP" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName) -join ','))
-
-        foreach ($p in @("$env:SystemRoot\System32\CHSIME.EXE", "$env:SystemRoot\System32\InputMethod\CHS\ChsIME.exe", "$env:SystemRoot\System32\InputMethod\SHARED\ChsIME.exe")) {
-          Say ("file " + $p + " : " + (Test-Path -LiteralPath $p))
+        Say "--- A: are the Chinese IME dictionaries already in the image? ---"
+        foreach ($d in @("$env:SystemRoot\System32\InputMethod\CHS", "$env:SystemRoot\System32\InputMethod\CHT", "$env:SystemRoot\IME")) {
+          if (Test-Path -LiteralPath $d) {
+            Say ("dir " + $d)
+            Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object -First 40 |
+              ForEach-Object { Say ("    " + $_.FullName.Substring($env:SystemRoot.Length) + "  " + [int]($_.Length / 1024) + " KB") }
+          } else {
+            Say ("dir " + $d + " : absent")
+          }
         }
-        Say ("InputMethod dirs: " + ((Get-ChildItem "$env:SystemRoot\System32\InputMethod" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ','))
 
-        try { Say ("Get-InstalledLanguage: " + ((Get-InstalledLanguage | ForEach-Object { "$($_.LanguageId)" }) -join ',')) }
-        catch { Say ("Get-InstalledLanguage failed: " + $_.Exception.Message) }
-
-        try { foreach ($e in (Get-WinUserLanguageList)) { Say ("user language: " + $e.LanguageTag + " | " + $e.Autonym + " | tips=" + ($e.InputMethodTips -join ';')) } }
-        catch { Say ("Get-WinUserLanguageList failed: " + $_.Exception.Message) }
-
-        foreach ($n in @("wuauserv", "UsoSvc", "BITS", "DoSvc", "TrustedInstaller")) {
+        Say "--- B: Windows Update related services snapshot ---"
+        foreach ($n in @("wuauserv", "UsoSvc", "BITS", "DoSvc", "TrustedInstaller", "msiserver")) {
           $s = Get-Service -Name $n -ErrorAction SilentlyContinue
-          Say ("service " + $n + " : " + ($(if ($s) { "$($s.Status)/$($s.StartType)" } else { "absent" })))
+          Say ("service " + $n + " : " + $(if ($s) { "$($s.Status)/$($s.StartType)" } else { "absent" }))
         }
 
-        # bounded DISM capability query: it is the same stack as Install-Language, so cap it
+        Say "--- C: bounded Add-WindowsCapability for Language.Basic~~~zh-CN (cap 240s) ---"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $j = Start-Job -ScriptBlock { (Get-WindowsCapability -Online -Name "Language.Basic~~~zh-CN~0.0.1.0").State }
-        $done = Wait-Job -Job $j -Timeout 90
+        $j = Start-Job -ScriptBlock { Add-WindowsCapability -Online -Name "Language.Basic~~~zh-CN~0.0.1.0" -ErrorAction Stop }
+        $done = Wait-Job -Job $j -Timeout 240
         if ($done) {
-          try { Say ("capability Language.Basic~~~zh-CN state: " + (Receive-Job -Job $j) + " (" + [int]$sw.Elapsed.TotalSeconds + "s)") }
-          catch { Say ("capability query failed: " + $_.Exception.Message) }
+          try {
+            $res = Receive-Job -Job $j -ErrorAction Stop
+            Say ("Add-WindowsCapability returned: " + (($res | Out-String).Trim() -replace "\s+", " ") + " after " + [int]$sw.Elapsed.TotalSeconds + "s")
+          } catch {
+            Say ("Add-WindowsCapability FAILED after " + [int]$sw.Elapsed.TotalSeconds + "s: " + $_.Exception.Message)
+          }
         } else {
-          Say ("capability query timed out after 90s (DISM/Windows Update stack is not responding)")
+          Say ("Add-WindowsCapability produced nothing in 240s -> the WU download path is unusable here")
         }
         Stop-Job -Job $j -ErrorAction SilentlyContinue
         Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
+        try { Say ("capability state now: " + (Get-WindowsCapability -Online -Name "Language.Basic~~~zh-CN~0.0.1.0").State) }
+        catch { Say ("state query failed: " + $_.Exception.Message) }
 
+        Say "--- D: can this OS register zh-CN + Microsoft Pinyin at all? ---"
+        try {
+          $list = New-WinUserLanguageList -Language "en-US"
+          $zh = New-WinUserLanguageList -Language "zh-CN"
+          $zh[0].InputMethodTips.Clear()
+          $zh[0].InputMethodTips.Add("0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}")
+          $list.Add($zh[0])
+          Set-WinUserLanguageList -LanguageList $list -Force
+          Say "Set-WinUserLanguageList: OK"
+        } catch {
+          Say ("Set-WinUserLanguageList FAILED: " + $_.Exception.Message)
+        }
+        foreach ($e in (Get-WinUserLanguageList)) {
+          Say ("after: " + $e.LanguageTag + " | " + $e.Autonym + " | tips=" + ($e.InputMethodTips -join ';'))
+        }
+
+        Say "--- E: lexicon files ---"
+        foreach ($p in @("$env:SystemRoot\System32\InputMethod\CHS\ChsPinyin.lex", "$env:SystemRoot\System32\InputMethod\CHS\ChsPinyinHR.lex", "$env:SystemRoot\System32\InputMethod\CHS\ChsPinyinEUDPv1.lex")) {
+          Say ("file " + $p + " : " + (Test-Path -LiteralPath $p))
+        }
         Say "probe done"
