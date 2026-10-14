@@ -30,12 +30,17 @@ jobs:
         Invoke-WebRequest `
           -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe `
           -OutFile cloudflared.exe
-    - name: Start cloudflared and show URL
+    - name: Start cloudflared and send URL to webhook
       shell: pwsh
       env:
         WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       run: |
         $ErrorActionPreference = "Stop"
+
+        # 隧道地址只投递到 webhook：不写 console、不写 notice、不写 step summary
+        if (-not $env:WEBHOOK_URL) {
+          Write-Error "WEBHOOK_URL is not configured; refusing to start because the tunnel URL could not be delivered"
+        }
 
         # 日志文件（只在 runner 本地）
         $log = "$PWD\cloudflared.log"
@@ -68,18 +73,37 @@ jobs:
           Write-Error "Failed to obtain trycloudflare URL"
         }
 
-        Write-Host ""
-        Write-Host "============================================================"
-        Write-Host "Cloudflare tunnel URL:"
-        Write-Host "$url"
-        Write-Host "============================================================"
-        Write-Host "::notice title=Cloudflare tunnel URL::$url"
+        $payload = @{
+          text       = "Windows RDP tunnel: $url"
+          url        = $url
+          repository = $env:GITHUB_REPOSITORY
+          run_id     = $env:GITHUB_RUN_ID
+          run_url    = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+        } | ConvertTo-Json -Compress
 
-        @"
-        ## Cloudflare tunnel URL
+        # 只投递到 webhook；重试 3 次，全部失败就 fail 掉 job（避免地址静默丢失）
+        $sent = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $sent; $attempt++) {
+          try {
+            Invoke-RestMethod -Method Post `
+              -Uri $env:WEBHOOK_URL `
+              -ContentType 'application/json' `
+              -Body $payload `
+              -TimeoutSec 30 | Out-Null
+            $sent = $true
+          } catch {
+            $status = $null
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            Write-Host "Webhook delivery attempt $attempt failed (HTTP status: $status)."
+            if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+          }
+        }
 
-        $url
-        "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+        if (-not $sent) {
+          Write-Error "Failed to deliver the tunnel URL to the webhook after 3 attempts"
+        }
+
+        Write-Host "Tunnel URL delivered to the webhook (it is intentionally not printed to the console)."
 
     - name: Keep runner alive
       shell: pwsh
