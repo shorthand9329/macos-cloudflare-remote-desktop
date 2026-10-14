@@ -24,6 +24,95 @@ jobs:
           -Name "fDenyTSConnections" -Value 0
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
+    # 中文输入法（微软拼音）。用 Windows PowerShell 5.1 跑：International /
+    # LanguagePackManagement 是 Windows PowerShell 模块，PS7 下需要隐式远程。
+    # 脚本正文保持纯 ASCII，避免 5.1 读取无 BOM 脚本时的编码问题。
+    - name: Install Chinese input method (Microsoft Pinyin)
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Continue"
+        $lang = "zh-CN"
+
+        # Microsoft Pinyin input tip: 0804 = zh-CN keyboard layout, first GUID = IME
+        # CLSID, second GUID = language profile. Verified present under
+        # HKLM:\SOFTWARE\Microsoft\CTF\TIP\{81D4E9C9-...}\LanguageProfile\0x00000804
+        $pinyinTip = "0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
+
+        Write-Host "=== 1/4 install zh-CN language pack and basic typing FOD (IME + dictionaries) ==="
+        $packOk = $false
+        try {
+          # No -CopyToSettings: keep the English system UI, add Chinese input only.
+          Install-Language -Language $lang -ErrorAction Stop
+          $packOk = $true
+          Write-Host "Install-Language $lang : OK"
+        } catch {
+          Write-Host "Install-Language $lang failed: $($_.Exception.Message)"
+        }
+
+        if (-not $packOk) {
+          # Fallback: install the Features on Demand directly. On Windows Server the
+          # Chinese IME dictionaries live in Language.Basic (basic typing).
+          foreach ($cap in @("Language.Basic~~~$lang~0.0.1.0", "Language.Fonts.Hans~~~und-CHS~0.0.1.0")) {
+            try {
+              $c = Get-WindowsCapability -Online -Name $cap -ErrorAction Stop
+              if ($c.State -ne "Installed") {
+                Add-WindowsCapability -Online -Name $cap -ErrorAction Stop | Out-Null
+              }
+              Write-Host "capability $cap : OK"
+            } catch {
+              Write-Host "capability $cap failed: $($_.Exception.Message)"
+            }
+          }
+        }
+
+        Write-Host "=== 2/4 add zh-CN (Microsoft Pinyin) to the current user language list ==="
+        try {
+          $list = New-WinUserLanguageList -Language "en-US"
+          $chinese = New-WinUserLanguageList -Language $lang
+          $chinese[0].InputMethodTips.Clear()
+          $chinese[0].InputMethodTips.Add($pinyinTip)
+          $list.Add($chinese[0])
+          Set-WinUserLanguageList -LanguageList $list -Force
+          Write-Host "language list written: en-US (default) + $lang (Microsoft Pinyin)"
+        } catch {
+          Write-Host "Set-WinUserLanguageList failed: $($_.Exception.Message)"
+        }
+
+        Write-Host "=== 3/4 register the input indicator (ctfmon) for the RDP session ==="
+        try {
+          $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
+          Set-ItemProperty -Path $runKey -Name "CTFMon" -Value "ctfmon.exe" -Force
+          if (-not (Get-Process -Name ctfmon -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath "$env:SystemRoot\System32\ctfmon.exe" -ErrorAction SilentlyContinue
+          }
+          Write-Host "ctfmon autostart registered"
+        } catch {
+          Write-Host "ctfmon setup failed: $($_.Exception.Message)"
+        }
+
+        Write-Host "=== 4/4 verify ==="
+        try {
+          $capState = (Get-WindowsCapability -Online -Name "Language.Basic~~~$lang~0.0.1.0" -ErrorAction Stop).State
+          Write-Host "Language.Basic~~~$lang state: $capState"
+          if ($capState -ne "Installed") {
+            Write-Host "WARNING: basic typing FOD is not installed; on Windows Server the IME dictionaries may show as 'not ready yet'."
+          }
+        } catch {
+          Write-Host "capability state query failed: $($_.Exception.Message)"
+        }
+
+        $check = Get-WinUserLanguageList
+        foreach ($entry in $check) {
+          Write-Host ("  entry: {0} | {1} | {2}" -f $entry.LanguageTag, $entry.Autonym, ($entry.InputMethodTips -join ' ; '))
+        }
+
+        $ok = $check | Where-Object { $_.LanguageTag -eq $lang -and $_.InputMethodTips.Count -gt 0 }
+        if (-not $ok) {
+          throw "Chinese input method setup failed: zh-CN is missing from the user language list or has no input method entry."
+        }
+        Write-Host "Chinese input method ready: after RDP login press Win+Space to switch to Microsoft Pinyin."
+
     - name: Download 
       shell: powershell
       run: |
