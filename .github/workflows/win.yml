@@ -144,15 +144,19 @@ jobs:
         }
         Say ("effective RIME schema_list: " + $schemaList)
 
-        $ready = [bool]($check | Where-Object { $_.LanguageTag -eq $lang -and $_.InputMethodTips.Count -gt 0 })
+        $ready = [bool]($check | Where-Object { $_.LanguageTag -like "zh-*" -and $_.InputMethodTips.Count -gt 0 })
+        # Set-WinUserLanguageList normalises the tag to zh-Hans-CN, so match on the prefix
+        $tips = (($check | Where-Object { $_.LanguageTag -like "zh-*" } | ForEach-Object { $_.InputMethodTips }) -join ",")
+        Say ("zh tips in the user language list: " + $tips)
         Say ("RESULT: " + $(if ($ready) { "Chinese IME registered (Win+Space -> RIME/Weasel)." } else { "no Chinese IME could be prepared." }))
         Say "This step never fails the job: RDP access matters more than the input method."
 
         if ($env:WEBHOOK_URL) {
           try {
             $body = @{
-              text        = "IME: ready=" + $ready + " rime_tip=" + $weaselTip + " schema_list=" + $schemaList + " ms_lexicon=" + $msLexicon
+              text        = "IME: ready=" + $ready + " tips=" + $tips + " rime_tip=" + $weaselTip + " schema_list=" + $schemaList + " ms_lexicon=" + $msLexicon
               ime_ready   = $ready
+              lang_tips   = $tips
               rime_tip    = $weaselTip
               schema_list = $schemaList
               ms_lexicon  = $msLexicon
