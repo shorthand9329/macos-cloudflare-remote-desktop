@@ -1,6 +1,6 @@
 name: diag-ime
 
-# 临时诊断（用完即删）：只做只读探测 + 一个有界的 FOD 安装尝试，结束即出日志。
+# 临时诊断（用完即删）：真跑一遍小狼毫静默安装并报告结果，结束即出日志。
 on:
   workflow_dispatch:
 
@@ -8,69 +8,103 @@ jobs:
   probe:
     runs-on: windows-latest
     steps:
-    - name: Probe IME dictionaries and bounded FOD install
+    - name: Try a silent RIME/Weasel install and report
       shell: powershell
-      timeout-minutes: 8
+      timeout-minutes: 12
       continue-on-error: true
       run: |
         $ErrorActionPreference = "Continue"
         function Say($m) { Write-Host ("PROBE " + $m) }
 
-        Say "--- A: are the Chinese IME dictionaries already in the image? ---"
-        foreach ($d in @("$env:SystemRoot\System32\InputMethod\CHS", "$env:SystemRoot\System32\InputMethod\CHT", "$env:SystemRoot\IME")) {
-          if (Test-Path -LiteralPath $d) {
-            Say ("dir " + $d)
-            Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue |
-              Select-Object -First 40 |
-              ForEach-Object { Say ("    " + $_.FullName.Substring($env:SystemRoot.Length) + "  " + [int]($_.Length / 1024) + " KB") }
-          } else {
-            Say ("dir " + $d + " : absent")
-          }
-        }
+        # TIP keys that already existed on this image before the install
+        $before = @(
+          "0000897b-83df-4b96-be07-0fb58b01c4a4","03b5835f-f03c-411b-9ce2-aa23e1171e36",
+          "07eb03d6-b001-41df-9192-bf9b841ee71f","531fdebf-9b4c-4a43-a2aa-960e8fcdc732",
+          "6a498709-e00b-4c45-a018-8f9e4081ae40","78cb5b0e-26ed-4fcc-854c-77e8f3d1aa80",
+          "7c472071-36a7-4709-88cc-859513e583a9","81d4e9c9-1d3b-41bc-9e6c-4b40bf79e35e",
+          "81ea0a17-aa39-455b-ba20-ea79a8f98966","8613e14c-d0c0-4161-ac0f-1dd2563286bc",
+          "a028ae76-01b1-46c2-99c4-acd9858ae02f","a1e2b86b-924a-4d43-80f6-8a820df7190f",
+          "ae6be008-07fb-400d-8beb-337a64f7051f","b115690a-ea02-48d5-a231-e3578d2fdf80",
+          "c1ee01f2-b3b6-4a6a-9ddd-e988c088ec82","c2cb2cf0-af47-413e-9780-8bc3a3c16068",
+          "dcbd6fa8-032f-11d3-b5b1-00c04fc324a1","e429b25a-e5d3-4d1f-9be3-0c608477e3a1",
+          "f25e9f57-2fc8-4eb3-a41a-cce5f08541e6","f89e9e58-bd2f-4008-9ac2-0f816c09f4ee")
 
-        Say "--- B: Windows Update related services snapshot ---"
-        foreach ($n in @("wuauserv", "UsoSvc", "BITS", "DoSvc", "TrustedInstaller", "msiserver")) {
-          $s = Get-Service -Name $n -ErrorAction SilentlyContinue
-          Say ("service " + $n + " : " + $(if ($s) { "$($s.Status)/$($s.StartType)" } else { "absent" }))
-        }
-
-        Say "--- C: bounded Add-WindowsCapability for Language.Basic~~~zh-CN (cap 240s) ---"
+        Say "--- 1: download the official Weasel release asset ---"
+        $url = "https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.17.4.0-installer.exe"
+        $exe = Join-Path $env:TEMP "weasel-installer.exe"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $j = Start-Job -ScriptBlock { Add-WindowsCapability -Online -Name "Language.Basic~~~zh-CN~0.0.1.0" -ErrorAction Stop }
-        $done = Wait-Job -Job $j -Timeout 240
-        if ($done) {
-          try {
-            $res = Receive-Job -Job $j -ErrorAction Stop
-            Say ("Add-WindowsCapability returned: " + (($res | Out-String).Trim() -replace "\s+", " ") + " after " + [int]$sw.Elapsed.TotalSeconds + "s")
-          } catch {
-            Say ("Add-WindowsCapability FAILED after " + [int]$sw.Elapsed.TotalSeconds + "s: " + $_.Exception.Message)
-          }
-        } else {
-          Say ("Add-WindowsCapability produced nothing in 240s -> the WU download path is unusable here")
+        try {
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -TimeoutSec 180
+          Say ("downloaded " + [int]((Get-Item -LiteralPath $exe).Length / 1MB) + " MB in " + [int]$sw.Elapsed.TotalSeconds + "s")
+        } catch {
+          Say ("download FAILED: " + $_.Exception.Message)
         }
-        Stop-Job -Job $j -ErrorAction SilentlyContinue
-        Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
-        try { Say ("capability state now: " + (Get-WindowsCapability -Online -Name "Language.Basic~~~zh-CN~0.0.1.0").State) }
-        catch { Say ("state query failed: " + $_.Exception.Message) }
 
-        Say "--- D: can this OS register zh-CN + Microsoft Pinyin at all? ---"
+        Say "--- 2: silent install (NSIS /S -> WeaselSetup /s = Simplified Chinese) ---"
+        if (Test-Path -LiteralPath $exe) {
+          $p = Start-Process -FilePath $exe -ArgumentList "/S" -PassThru -WindowStyle Hidden
+          $null = Wait-Process -Id $p.Id -Timeout 420 -ErrorAction SilentlyContinue
+          if ($p.HasExited) { Say ("installer exit code: " + $p.ExitCode) }
+          else { try { $p.Kill() } catch {} ; Say "installer TIMED OUT after 420s" }
+        }
+
+        Say "--- 3: what landed on disk ---"
+        $inst = Get-ChildItem "$env:ProgramFiles\Rime" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $inst) {
+          Say "C:\Program Files\Rime : absent -> install did not happen"
+        } else {
+          Say ("install dir: " + $inst.FullName)
+          Get-ChildItem -LiteralPath $inst.FullName -File | Select-Object -First 25 | ForEach-Object { Say ("    " + $_.Name + "  " + [int]($_.Length / 1024) + " KB") }
+          $data = Join-Path $inst.FullName "data"
+          Say ("schema files: " + ((Get-ChildItem -LiteralPath $data -Filter "*.schema.yaml" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ","))
+          Say ("luna_pinyin_simp.schema.yaml present: " + (Test-Path -LiteralPath (Join-Path $data "luna_pinyin_simp.schema.yaml")))
+          Say ("WeaselServer process: " + [bool](Get-Process -Name WeaselServer -ErrorAction SilentlyContinue))
+          Say ("WeaselServer Run key: " + (Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name WeaselServer -ErrorAction SilentlyContinue).WeaselServer)
+        }
+
+        Say "--- 4: new TSF profiles registered (diff against the known-before set) ---"
+        $new = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\CTF\TIP" -ErrorAction SilentlyContinue |
+          Where-Object { $before -notcontains $_.PSChildName.Trim('{}').ToLower() }
+        foreach ($k in $new) {
+          $clsid = $k.PSChildName
+          $dll = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+          Say ("new TIP " + $clsid + " -> " + $dll)
+          foreach ($lp in (Get-ChildItem "$($k.PSPath)\LanguageProfile" -ErrorAction SilentlyContinue)) {
+            $langid = $lp.PSChildName
+            foreach ($prof in (Get-ChildItem $lp.PSPath -ErrorAction SilentlyContinue)) {
+              Say ("    tip " + $langid.TrimStart("0x") + ":" + $clsid + $prof.PSChildName)
+            }
+          }
+        }
+
+        Say "--- 5: select the simplified schema and deploy ---"
+        if ($inst) {
+          $rimeUser = Join-Path $env:APPDATA "Rime"
+          New-Item -ItemType Directory -Force -Path $rimeUser | Out-Null
+          $schema = if (Test-Path -LiteralPath (Join-Path $inst.FullName "data\luna_pinyin_simp.schema.yaml")) { "luna_pinyin_simp" } else { "luna_pinyin" }
+          $cfg = "patch:`n  schema_list:`n    - schema: " + $schema + "`n"
+          [System.IO.File]::WriteAllText((Join-Path $rimeUser "default.custom.yaml"), $cfg, (New-Object System.Text.UTF8Encoding($false)))
+          Say ("wrote " + (Join-Path $rimeUser "default.custom.yaml") + " selecting " + $schema)
+
+          $dep = Join-Path $inst.FullName "WeaselDeployer.exe"
+          if (Test-Path -LiteralPath $dep) {
+            $d = Start-Process -FilePath $dep -ArgumentList "/deploy" -PassThru -WindowStyle Hidden
+            $null = Wait-Process -Id $d.Id -Timeout 180 -ErrorAction SilentlyContinue
+            if ($d.HasExited) { Say ("deployer exit code: " + $d.ExitCode) } else { try { $d.Kill() } catch {} ; Say "deployer TIMED OUT after 180s" }
+          } else { Say "WeaselDeployer.exe not found" }
+
+          Say ("user dir contents: " + ((Get-ChildItem -LiteralPath $rimeUser -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ","))
+          Say ("build dir contents: " + ((Get-ChildItem -LiteralPath (Join-Path $rimeUser "build") -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ","))
+        }
+
+        Say "--- 6: user language list (before/after of Set-WinUserLanguageList is win.yml's job) ---"
         try {
           $list = New-WinUserLanguageList -Language "en-US"
           $zh = New-WinUserLanguageList -Language "zh-CN"
-          $zh[0].InputMethodTips.Clear()
-          $zh[0].InputMethodTips.Add("0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}")
           $list.Add($zh[0])
           Set-WinUserLanguageList -LanguageList $list -Force
-          Say "Set-WinUserLanguageList: OK"
-        } catch {
-          Say ("Set-WinUserLanguageList FAILED: " + $_.Exception.Message)
-        }
+        } catch { Say ("Set-WinUserLanguageList failed: " + $_.Exception.Message) }
         foreach ($e in (Get-WinUserLanguageList)) {
-          Say ("after: " + $e.LanguageTag + " | " + $e.Autonym + " | tips=" + ($e.InputMethodTips -join ';'))
-        }
-
-        Say "--- E: lexicon files ---"
-        foreach ($p in @("$env:SystemRoot\System32\InputMethod\CHS\ChsPinyin.lex", "$env:SystemRoot\System32\InputMethod\CHS\ChsPinyinHR.lex", "$env:SystemRoot\System32\InputMethod\CHS\ChsPinyinEUDPv1.lex")) {
-          Say ("file " + $p + " : " + (Test-Path -LiteralPath $p))
+          Say ("after: " + $e.LanguageTag + " | " + $e.Autonym + " | tips=" + ($e.InputMethodTips -join ";"))
         }
         Say "probe done"
